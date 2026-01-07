@@ -11,7 +11,7 @@ from app.clients.kakao_local import KakaoLocalClient
 from app.clients.seoul_citydata import SeoulCityDataClient
 from app.services.recommender import OffpeakRecommender, load_zones_from_seed
 
-router = APIRouter(prefix="/v1/recommendations", tags=["recommendations"])
+router = APIRouter(prefix="/recommendations", tags=["recommendations"])
 
 Category = Literal["cafe", "restaurant"]
 
