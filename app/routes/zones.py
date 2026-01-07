@@ -11,7 +11,7 @@ from app.clients.kakao_local import KakaoLocalClient
 from app.clients.seoul_citydata import SeoulCityDataClient
 from app.services.recommender import OffpeakRecommender, load_zones_from_seed
 
-router = APIRouter(prefix="/v1/zones", tags=["zones"])
+router = APIRouter(prefix="/zones", tags=["zones"])
 
 
 @lru_cache(maxsize=1)
