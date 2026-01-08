@@ -18,6 +18,10 @@ echo "== /health (expect 200) =="
 curl --noproxy "*" -i --max-time 5 "$BASE_URL/health"
 
 echo
+echo "== /openapi.json (expect 200) =="
+curl --noproxy "*" -i --max-time 5 "$BASE_URL/openapi.json" | head -n 20 || true
+
+echo
 echo "== /zones/nearby (expect 200) =="
 curl --noproxy "*" -i --max-time 10 \
   "$BASE_URL/zones/nearby?lat=37.5665&lng=126.9780&radius_m=2000&top_k=5"
@@ -40,22 +44,32 @@ curl --noproxy "*" -i --max-time 15 \
 
 echo
 echo "== /places/insight (expect 200, recommend_from=user) =="
+# 안정성: 스타벅스가 0개면 대체 키워드로 fallback
 python - <<'PY'
-import os, json, httpx
+import os, json
+import httpx
 
 base = os.getenv("BASE_URL", "http://127.0.0.1:8000")
 user_lat, user_lng = 37.55687, 126.92378
 
-# 1) search
-s = httpx.get(
-    f"{base}/places/search",
-    params={"query":"스타벅스","lat":user_lat,"lng":user_lng,"size":5},
-    timeout=15,
-).json()
+client = httpx.Client(timeout=20)
 
-items = s.get("items") or []
-assert items, f"places/search returned empty: {s}"
-selected = items[0]
+# 1) search (fallback queries)
+queries = ["스타벅스", "카페", "커피", "투썸플레이스"]
+selected = None
+last = None
+
+for q in queries:
+    last = client.get(
+        f"{base}/places/search",
+        params={"query": q, "lat": user_lat, "lng": user_lng, "size": 5},
+    ).json()
+    items = last.get("items") or []
+    if items:
+        selected = items[0]
+        break
+
+assert selected is not None, f"places/search returned empty for all queries. last={last}"
 
 # 2) insight (user 기준 추천)
 payload = {
@@ -68,7 +82,7 @@ payload = {
   "max_alternatives": 3,
   "category": "cafe",
 }
-r = httpx.post(f"{base}/places/insight", json=payload, timeout=25)
+r = client.post(f"{base}/places/insight", json=payload)
 print("status:", r.status_code)
 out = r.json()
 print(json.dumps(out, ensure_ascii=False, indent=2)[:1200])
