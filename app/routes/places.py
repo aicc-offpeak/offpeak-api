@@ -3,19 +3,19 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
 
 import httpx
 from cachetools import TTLCache
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from app.clients.seoul_citydata import SeoulCityDataClient
+
 KAKAO_BASE_URL = "https://dapi.kakao.com"
-SEOUL_OPENAPI_BASE = "http://openapi.seoul.go.kr:8088"
 
 router = APIRouter(prefix="/places", tags=["places"])
 
@@ -26,13 +26,17 @@ router = APIRouter(prefix="/places", tags=["places"])
 class PlaceItem(BaseModel):
     id: str
     name: str
-    category_name: str = ""
-    category_group_code: str = ""
-    category_group_name: str = ""
+    category_name: str = ""  # 상세 카테고리 (예: "카페,디저트", "한식,육류,고기요리")
+    category_group_code: str = ""  # 대분류 코드 (CE7: 카페, FD6: 음식점)
+    category_group_name: str = ""  # 대분류명 (카페, 음식점)
     phone: str = ""
     address_name: str = ""
     road_address_name: str = ""
     place_url: str = ""
+
+    # 카드용(대안): place_url에서 og:image 추출
+    image_url: str = ""
+
     lat: float
     lng: float
     distance_m: float = 0.0
@@ -44,8 +48,10 @@ class ZoneInfo(BaseModel):
     lat: float
     lng: float
     distance_m: float
-    crowding_level: str = ""
-    crowding_rank: int = 0
+
+    crowding_level: str = ""          # 여유/보통/약간 붐빔/붐빔
+    crowding_rank: int = 0            # 여유=4 ... 붐빔=1, 정보없음=0
+    crowding_color: str = ""          # green/yellow/orange/red/""
     crowding_updated_at: int = 0
     crowding_message: str = ""
 
@@ -78,6 +84,9 @@ class PlacesInsightRequest(BaseModel):
 
     # (선택) cafe -> CE7, food -> FD6 강제 지정
     category: Optional[str] = None
+
+    # 카드 사진 포함 여부(기본 true)
+    include_image: bool = True
 
 
 class PlacesInsightResponse(BaseModel):
@@ -112,13 +121,18 @@ def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return r * c
 
 
-CROWDING_RANK = {
-    "여유": 4,
-    "보통": 3,
-    "약간 붐빔": 2,
-    "붐빔": 1,
-    "매우 붐빔": 0,
-}
+# 4단계로 정규화
+def _normalize_crowding(level: str) -> str:
+    level = (level or "").strip()
+    if level in {"여유", "보통", "약간 붐빔", "붐빔"}:
+        return level
+    if level in {"매우 붐빔"}:
+        return "붐빔"
+    return ""
+
+
+CROWDING_RANK = {"여유": 4, "보통": 3, "약간 붐빔": 2, "붐빔": 1, "": 0}
+CROWDING_COLOR = {"여유": "green", "보통": "yellow", "약간 붐빔": "orange", "붐빔": "red", "": ""}
 
 
 # -------------------------
@@ -162,80 +176,51 @@ def _nearest_zone(lat: float, lng: float) -> Tuple[Dict[str, Any], float]:
 
 
 # -------------------------
-# Seoul crowding client (citydata_ppltn)
+# Seoul crowding client + cache
 # -------------------------
-_crowd_cache = TTLCache(
-    maxsize=512, ttl=int(os.getenv("CROWDING_CACHE_TTL_S", "300") or "300")
-)
+_seoul_client = SeoulCityDataClient()
+_crowd_cache = TTLCache(maxsize=512, ttl=int(os.getenv("CROWDING_CACHE_TTL_S", "300") or "300"))
 
 
-def _parse_seoul_time_to_epoch(s: str) -> int:
-    try:
-        dt = datetime.strptime(s.strip(), "%Y-%m-%d %H:%M")
-        return int(dt.timestamp())
-    except Exception:
-        return int(time.time())
-
-
-def _fetch_crowding_by_area_name(area_name: str) -> Tuple[str, str, int]:
+def _fetch_crowding_for_zone(code: str, name: str) -> Tuple[str, str, int]:
     """
     Returns (level, message, updated_at_epoch)
     """
-    if area_name in _crowd_cache:
-        return _crowd_cache[area_name]
+    cache_key = code or name
+    if cache_key in _crowd_cache:
+        return _crowd_cache[cache_key]
 
-    key = os.getenv("SEOUL_CITY_NOW_API_KEY") or os.getenv("SEOUL_CITY_AREA_API_KEY")
-    if not key:
+    # SeoulCityDataClient에는 is_configured()가 없으므로 api_key 존재 여부로 판단
+    if not getattr(_seoul_client, "api_key", ""):
         result = ("", "", 0)
-        _crowd_cache[area_name] = result
+        _crowd_cache[cache_key] = result
         return result
 
-    encoded = quote(area_name, safe="")
-    url = f"{SEOUL_OPENAPI_BASE}/{key}/json/citydata_ppltn/1/1/{encoded}"
-
-    with httpx.Client(timeout=8.0, trust_env=False) as client:
-        r = client.get(url)
-
-    if r.status_code != 200:
-        result = ("", "", 0)
-        _crowd_cache[area_name] = result
-        return result
-
-    data = r.json()
-    root_key = next((k for k in data.keys() if "citydata_ppltn" in k), None)
-    if not root_key:
-        result = ("", "", 0)
-        _crowd_cache[area_name] = result
-        return result
-
-    arr = data.get(root_key) or []
-    if not arr:
-        result = ("", "", 0)
-        _crowd_cache[area_name] = result
-        return result
-
-    row = arr[0]
-    lvl = _safe_str(row.get("AREA_CONGEST_LVL"))
-    msg = _safe_str(row.get("AREA_CONGEST_MSG"))
-    t = _safe_str(row.get("PPLTN_TIME"))
-    updated = _parse_seoul_time_to_epoch(t) if t else int(time.time())
+    c = _seoul_client.fetch_area_crowding(area_code=code, area_name=name)
+    lvl = _normalize_crowding(c.level)
+    msg = c.message or ""
+    updated = int(c.updated_at or 0)
 
     result = (lvl, msg, updated)
-    _crowd_cache[area_name] = result
+    _crowd_cache[cache_key] = result
     return result
 
 
 def _zone_info_for_point(lat: float, lng: float) -> ZoneInfo:
     z, d = _nearest_zone(lat, lng)
-    lvl, msg, updated = _fetch_crowding_by_area_name(_safe_str(z.get("name")))
+    code = _safe_str(z.get("code"))
+    name = _safe_str(z.get("name"))
+    lvl, msg, updated = _fetch_crowding_for_zone(code, name)
+
     return ZoneInfo(
-        code=_safe_str(z.get("code")),
-        name=_safe_str(z.get("name")),
+        code=code,
+        name=name,
         lat=float(z.get("lat") or 0.0),
         lng=float(z.get("lng") or 0.0),
         distance_m=float(d),
         crowding_level=lvl,
         crowding_rank=int(CROWDING_RANK.get(lvl, 0)),
+        crowding_color=str(CROWDING_COLOR.get(lvl, "")),
         crowding_updated_at=int(updated),
         crowding_message=msg,
     )
@@ -265,6 +250,7 @@ def kakao_keyword_search(
     url = f"{KAKAO_BASE_URL}/v2/local/search/keyword.json"
     headers = {"Authorization": f"KakaoAK {_kakao_rest_key()}"}
 
+    # Kakao: radius<=20000, size<=15
     radius_m = int(max(0, min(radius_m, 20000)))
     size = int(max(1, min(size, 15)))
 
@@ -343,7 +329,7 @@ def kakao_category_search(
     카테고리 검색을 여러 페이지로 호출해 max_results까지 모음.
     (카카오 size<=15 제약 해결)
     """
-    max_results = int(max(1, min(max_results, 45)))  # 과도한 호출 방지
+    max_results = int(max(1, min(max_results, 45)))
     docs_all: List[Dict[str, Any]] = []
     seen_ids: set[str] = set()
 
@@ -388,10 +374,53 @@ def _doc_to_place(d: Dict[str, Any]) -> PlaceItem:
         address_name=_safe_str(d.get("address_name")),
         road_address_name=_safe_str(d.get("road_address_name")),
         place_url=_safe_str(d.get("place_url")),
+        image_url="",
         lat=_safe_float(d.get("y")),
         lng=_safe_float(d.get("x")),
         distance_m=_safe_float(d.get("distance")),
     )
+
+
+# -------------------------
+# place_url -> og:image (카드 썸네일 대안)
+# -------------------------
+_image_cache = TTLCache(maxsize=1024, ttl=int(os.getenv("PLACE_IMAGE_CACHE_TTL_S", "3600") or "3600"))
+_OG_IMAGE_RE = re.compile(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', re.IGNORECASE)
+
+
+def _extract_og_image(html: str) -> str:
+    m = _OG_IMAGE_RE.search(html or "")
+    return (m.group(1).strip() if m else "")
+
+
+def _place_image_from_url(place_url: str) -> str:
+    place_url = (place_url or "").strip()
+    if not place_url:
+        return ""
+    if place_url in _image_cache:
+        return _image_cache[place_url]
+
+    try:
+        with httpx.Client(timeout=6.0, trust_env=False, follow_redirects=True) as client:
+            r = client.get(place_url, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            _image_cache[place_url] = ""
+            return ""
+        img = _extract_og_image(r.text)
+        _image_cache[place_url] = img
+        return img
+    except Exception:
+        _image_cache[place_url] = ""
+        return ""
+
+
+def _maybe_enrich_image(p: PlaceItem, include: bool) -> PlaceItem:
+    if not include:
+        return p
+    if p.image_url:
+        return p
+    img = _place_image_from_url(p.place_url)
+    return p.copy(update={"image_url": img})
 
 
 # -------------------------
@@ -404,35 +433,26 @@ def search_places(
     lng: float = Query(..., ge=-180, le=180, description="현재 경도"),
     size: int = Query(5, ge=1, le=15, description="가까운 순 결과 개수(기본 5)"),
     radius_m: int = Query(3000, ge=0, le=20000, description="검색 반경(m) (기본 3000)"),
-    # B) 기본 스코프: 카페+음식점만
     scope: str = Query(
         "food_cafe",
         description="검색 스코프: cafe(카페), food(음식점), food_cafe(기본), all(필터 없음)",
     ),
-    # (선택) 강제 필터: 카페=CE7, 음식점=FD6
     category_group_code: Optional[str] = Query(
         None,
         description="카테고리 그룹 코드 필터 (카페=CE7, 음식점=FD6)",
     ),
 ) -> PlacesSearchResponse:
     """
-    검색어(query)를 기준으로, (lat,lng)에서 가까운 장소를 distance 정렬로 반환.
-    기본은 카페+음식점만 내려가도록(scope=food_cafe).
+    내 위치와 검색어 기준으로 가까운 카페/음식점 리스트를 거리순으로 조회
+
     """
     try:
-        docs = kakao_keyword_search(
-            query=query,
-            lat=lat,
-            lng=lng,
-            radius_m=radius_m,
-            size=size,
-        )
+        docs = kakao_keyword_search(query=query, lat=lat, lng=lng, radius_m=radius_m, size=size)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"places search failed: {e}")
 
-    # 스코프/카테고리 필터링
     valid_scopes = {"cafe", "food", "food_cafe", "all"}
     if scope not in valid_scopes:
         raise HTTPException(status_code=400, detail=f"invalid scope: {scope}")
@@ -445,7 +465,7 @@ def search_places(
         allowed = {"FD6"}
     elif scope == "food_cafe":
         allowed = {"CE7", "FD6"}
-    else:  # all
+    else:
         allowed = None
 
     if allowed is not None:
@@ -458,16 +478,12 @@ def search_places(
 @router.post("/insight", response_model=PlacesInsightResponse)
 def insight(req: PlacesInsightRequest) -> PlacesInsightResponse:
     """
-    선택한 가게 1개에 대해:
-    - 해당 가게의 zone 혼잡도
-    - 덜 붐비는 대체 가게 3개(같은 카테고리 그룹, 주변 반경)
-    - recommend_from=user 옵션으로 사용자 기준 후보 검색도 가능
+    선택한 가게의 Zone 혼잡도와 덜 붐비는 대체 가게 몇 곳을 함께 조회
+
     """
-    # validate recommend_from
     if req.recommend_from not in {"selected", "user"}:
         raise HTTPException(status_code=400, detail="recommend_from must be 'selected' or 'user'")
 
-    # 후보 탐색 중심점 선택
     if req.recommend_from == "user" and req.user_lat is not None and req.user_lng is not None:
         center_lat = float(req.user_lat)
         center_lng = float(req.user_lng)
@@ -480,16 +496,16 @@ def insight(req: PlacesInsightRequest) -> PlacesInsightResponse:
     if req.category:
         if req.category.lower() == "cafe":
             cgc = "CE7"
-        elif req.category.lower() == "food":
+        elif req.category.lower() in {"food", "restaurant"}:
             cgc = "FD6"
     if not cgc:
         cgc = "CE7"
 
-    # selected zone (선택 가게 기준으로 혼잡도)
     selected_zone = _zone_info_for_point(req.selected.lat, req.selected.lng)
-    selected = PlaceWithZone(place=req.selected, zone=selected_zone)
+    selected_place = _maybe_enrich_image(req.selected, req.include_image)
+    selected = PlaceWithZone(place=selected_place, zone=selected_zone)
 
-    # candidates (same category group around center)
+    # candidates
     try:
         docs = kakao_category_search(
             category_group_code=cgc,
@@ -506,12 +522,13 @@ def insight(req: PlacesInsightRequest) -> PlacesInsightResponse:
         p = _doc_to_place(d)
         if not p.id or p.id == req.selected.id:
             continue
+        p = _maybe_enrich_image(p, req.include_image)
         z = _zone_info_for_point(p.lat, p.lng)
         candidates.append(PlaceWithZone(place=p, zone=z))
 
-    # choose alternatives:
-    # 1) 덜 붐비는 것 우선(crowding_rank 높은 것)
-    # 2) 같으면 가까운 것(distance_m 낮은 것)  -> center 기준 거리(사용자/user 또는 선택가게/selected)
+    # alternatives selection:
+    # 1) 덜 붐비는 것 우선 (rank 높은 것)
+    # 2) 같으면 가까운 것 우선 (place.distance_m: center 기준 distance)
     sel_rank = selected_zone.crowding_rank
     better = [x for x in candidates if x.zone.crowding_rank > sel_rank]
     pool = better if better else candidates

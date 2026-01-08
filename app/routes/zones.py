@@ -33,6 +33,9 @@ async def nearby_zones(
     radius_m: int = Query(3000, ge=200, le=20000),
     top_k: int = Query(8, ge=1, le=30),
 ) -> Dict[str, Any]:
+    """
+    내 위치 기준 가까운 Zone(상권/지역)과 각 Zone의 현재 혼잡도를 조회
+    """
     rec = _get_recommender()
     candidates = rec.nearby_zones(user_lat=lat, user_lng=lng, radius_m=radius_m, top_k=top_k)
 
