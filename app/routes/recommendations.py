@@ -36,6 +36,9 @@ async def recommend(
     radius_m: int = Query(3000, ge=200, le=20000),
     max_results: int = Query(20, ge=1, le=50),
 ) -> Dict[str, Any]:
+    """
+    내 위치 기준 덜 붐비는 Zone을 우선 골라 그 주변 카페/음식점을 추천
+    """
     rec = _get_recommender()
 
     items = await rec.recommend_places(

@@ -67,11 +67,12 @@ class OffpeakRecommender:
         if cached:
             return cached
 
-        level, raw = await self.seoul.fetch_area_crowding(area_name=zone.name)
+        # SeoulCityDataClient는 동기 클라이언트이므로 그대로 호출 (I/O 블로킹 허용)
+        sc = self.seoul.fetch_area_crowding(area_name=zone.name)
 
         # Use a lightweight timestamp (epoch seconds) without extra deps
         import time
-        zc = ZoneCrowding(level=str(level), updated_at_epoch=int(time.time()), raw=raw)
+        zc = ZoneCrowding(level=str(sc.level), updated_at_epoch=int(time.time()), raw=sc.raw)
         self._crowding_cache[zone.code] = zc
         return zc
 
