@@ -51,7 +51,7 @@ class SeoulCityDataClient:
 
     @staticmethod
     def _pick_api_key() -> str:
-        # ✅ 표준: 이 키만 쓰는 걸 권장
+        # 표준: 이 키만 쓰는 걸 권장
         key = (os.getenv("SEOUL_OPENAPI_KEY") or "").strip()
         if key:
             return key
