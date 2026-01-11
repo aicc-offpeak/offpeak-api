@@ -1,22 +1,25 @@
 from __future__ import annotations
 
-import json
 import math
 import os
 import re
-import time
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from cachetools import TTLCache
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
+from sqlalchemy import desc, select
+from sqlalchemy.orm import Session
 
-from app.clients.seoul_citydata import SeoulCityDataClient
+from app.db import get_db
+from app.models import CrowdingSnapshot as CrowdingSnapshotRow
+from app.models import Zone
+from app.services.crowding import CrowdingService, crowding_color, crowding_rank
+from app.services.place_cache import PlaceCacheService
 
 KAKAO_BASE_URL = "https://dapi.kakao.com"
-
 router = APIRouter(prefix="/places", tags=["places"])
 
 
@@ -26,17 +29,14 @@ router = APIRouter(prefix="/places", tags=["places"])
 class PlaceItem(BaseModel):
     id: str
     name: str
-    category_name: str = ""  # 상세 카테고리 (예: "카페,디저트", "한식,육류,고기요리")
-    category_group_code: str = ""  # 대분류 코드 (CE7: 카페, FD6: 음식점)
-    category_group_name: str = ""  # 대분류명 (카페, 음식점)
+    category_name: str = ""
+    category_group_code: str = ""
+    category_group_name: str = ""
     phone: str = ""
     address_name: str = ""
     road_address_name: str = ""
     place_url: str = ""
-
-    # 카드용(대안): place_url에서 og:image 추출
     image_url: str = ""
-
     lat: float
     lng: float
     distance_m: float = 0.0
@@ -48,10 +48,9 @@ class ZoneInfo(BaseModel):
     lat: float
     lng: float
     distance_m: float
-
-    crowding_level: str = ""          # 여유/보통/약간 붐빔/붐빔
-    crowding_rank: int = 0            # 여유=4 ... 붐빔=1, 정보없음=0
-    crowding_color: str = ""          # green/yellow/orange/red/""
+    crowding_level: str = ""
+    crowding_rank: int = 0
+    crowding_color: str = "unknown"
     crowding_updated_at: int = 0
     crowding_message: str = ""
 
@@ -67,25 +66,15 @@ class PlacesSearchResponse(BaseModel):
 
 class PlacesInsightRequest(BaseModel):
     selected: PlaceItem
-
-    # (선택) 사용자 위치
     user_lat: Optional[float] = None
     user_lng: Optional[float] = None
 
-    # 추천 중심점 선택: selected(기본) / user
-    recommend_from: str = Field(
-        default="selected",
-        description="대체 후보 중심점: selected(기본)=선택가게 기준, user=사용자 기준",
-    )
-
+    recommend_from: str = Field(default="selected", description="selected(기본) / user")
     radius_m: int = 1200
     max_candidates: int = 25
     max_alternatives: int = 3
 
-    # (선택) cafe -> CE7, food -> FD6 강제 지정
     category: Optional[str] = None
-
-    # 카드 사진 포함 여부(기본 true)
     include_image: bool = True
 
 
@@ -121,121 +110,16 @@ def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return r * c
 
 
-# 4단계로 정규화
-def _normalize_crowding(level: str) -> str:
-    level = (level or "").strip()
-    if level in {"여유", "보통", "약간 붐빔", "붐빔"}:
-        return level
-    if level in {"매우 붐빔"}:
-        return "붐빔"
-    return ""
-
-
-CROWDING_RANK = {"여유": 4, "보통": 3, "약간 붐빔": 2, "붐빔": 1, "": 0}
-CROWDING_COLOR = {"여유": "green", "보통": "yellow", "약간 붐빔": "orange", "붐빔": "red", "": ""}
-
-
-# -------------------------
-# Zones index (from zones_seed.json)
-# -------------------------
-_ZONES: Optional[List[Dict[str, Any]]] = None
-
-
-def _load_zones() -> List[Dict[str, Any]]:
-    global _ZONES
-    if _ZONES is not None:
-        return _ZONES
-
-    seed_path = os.getenv("ZONES_SEED_PATH", "app/resources/zones_seed.json")
-    p = Path(seed_path)
-    if not p.exists():
-        raise RuntimeError(f"Zones seed not found: {seed_path}")
-
-    _ZONES = json.loads(p.read_text(encoding="utf-8"))
-    return _ZONES
-
-
-def _nearest_zone(lat: float, lng: float) -> Tuple[Dict[str, Any], float]:
-    zones = _load_zones()
-    best = None
-    best_d = 1e18
-    for z in zones:
-        zlat = float(z.get("lat") or 0.0)
-        zlng = float(z.get("lng") or 0.0)
-        if zlat == 0.0 and zlng == 0.0:
-            continue
-        d = _haversine_m(lat, lng, zlat, zlng)
-        if d < best_d:
-            best = z
-            best_d = d
-
-    if not best:
-        raise RuntimeError("No valid zones in seed (all coords missing?)")
-
-    return best, best_d
-
-
-# -------------------------
-# Seoul crowding client + cache
-# -------------------------
-_seoul_client = SeoulCityDataClient()
-_crowd_cache = TTLCache(maxsize=512, ttl=int(os.getenv("CROWDING_CACHE_TTL_S", "300") or "300"))
-
-
-def _fetch_crowding_for_zone(code: str, name: str) -> Tuple[str, str, int]:
-    """
-    Returns (level, message, updated_at_epoch)
-    """
-    cache_key = code or name
-    if cache_key in _crowd_cache:
-        return _crowd_cache[cache_key]
-
-    # SeoulCityDataClient에는 is_configured()가 없으므로 api_key 존재 여부로 판단
-    if not getattr(_seoul_client, "api_key", ""):
-        result = ("", "", 0)
-        _crowd_cache[cache_key] = result
-        return result
-
-    c = _seoul_client.fetch_area_crowding(area_code=code, area_name=name)
-    lvl = _normalize_crowding(c.level)
-    msg = c.message or ""
-    updated = int(c.updated_at or 0)
-
-    result = (lvl, msg, updated)
-    _crowd_cache[cache_key] = result
-    return result
-
-
-def _zone_info_for_point(lat: float, lng: float) -> ZoneInfo:
-    z, d = _nearest_zone(lat, lng)
-    code = _safe_str(z.get("code"))
-    name = _safe_str(z.get("name"))
-    lvl, msg, updated = _fetch_crowding_for_zone(code, name)
-
-    return ZoneInfo(
-        code=code,
-        name=name,
-        lat=float(z.get("lat") or 0.0),
-        lng=float(z.get("lng") or 0.0),
-        distance_m=float(d),
-        crowding_level=lvl,
-        crowding_rank=int(CROWDING_RANK.get(lvl, 0)),
-        crowding_color=str(CROWDING_COLOR.get(lvl, "")),
-        crowding_updated_at=int(updated),
-        crowding_message=msg,
-    )
-
-
-# -------------------------
-# Kakao local calls
-# -------------------------
 def _kakao_rest_key() -> str:
-    rest_key = os.getenv("KAKAO_REST_API_KEY")
+    rest_key = (os.getenv("KAKAO_REST_API_KEY") or "").strip()
     if not rest_key:
         raise RuntimeError("KAKAO_REST_API_KEY is missing in environment variables.")
     return rest_key
 
 
+# -------------------------
+# Kakao local calls
+# -------------------------
 def kakao_keyword_search(
     *,
     query: str,
@@ -244,13 +128,9 @@ def kakao_keyword_search(
     radius_m: int,
     size: int,
 ) -> List[Dict[str, Any]]:
-    """
-    키워드 기반 검색(검색창 리스트용)
-    """
     url = f"{KAKAO_BASE_URL}/v2/local/search/keyword.json"
     headers = {"Authorization": f"KakaoAK {_kakao_rest_key()}"}
 
-    # Kakao: radius<=20000, size<=15
     radius_m = int(max(0, min(radius_m, 20000)))
     size = int(max(1, min(size, 15)))
 
@@ -283,10 +163,6 @@ def kakao_category_search_page(
     size: int,
     page: int,
 ) -> tuple[List[Dict[str, Any]], bool]:
-    """
-    카테고리 검색 1페이지 호출 (Kakao 제약: size <= 15)
-    Returns (docs, is_end)
-    """
     url = f"{KAKAO_BASE_URL}/v2/local/search/category.json"
     headers = {"Authorization": f"KakaoAK {_kakao_rest_key()}"}
 
@@ -325,10 +201,6 @@ def kakao_category_search(
     radius_m: int,
     max_results: int,
 ) -> List[Dict[str, Any]]:
-    """
-    카테고리 검색을 여러 페이지로 호출해 max_results까지 모음.
-    (카카오 size<=15 제약 해결)
-    """
     max_results = int(max(1, min(max_results, 45)))
     docs_all: List[Dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -382,10 +254,13 @@ def _doc_to_place(d: Dict[str, Any]) -> PlaceItem:
 
 
 # -------------------------
-# place_url -> og:image (카드 썸네일 대안)
+# place_url -> og:image
 # -------------------------
 _image_cache = TTLCache(maxsize=1024, ttl=int(os.getenv("PLACE_IMAGE_CACHE_TTL_S", "3600") or "3600"))
-_OG_IMAGE_RE = re.compile(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', re.IGNORECASE)
+_OG_IMAGE_RE = re.compile(
+    r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
 
 
 def _extract_og_image(html: str) -> str:
@@ -420,7 +295,117 @@ def _maybe_enrich_image(p: PlaceItem, include: bool) -> PlaceItem:
     if p.image_url:
         return p
     img = _place_image_from_url(p.place_url)
-    return p.copy(update={"image_url": img})
+    return p.model_copy(update={"image_url": img})
+
+
+# -------------------------
+# DB helpers: zone + crowding snapshot
+# -------------------------
+def _get_latest_snapshot(db: Session, zone_code: str) -> CrowdingSnapshotRow | None:
+    stmt = (
+        select(CrowdingSnapshotRow)
+        .where(CrowdingSnapshotRow.zone_code == zone_code)
+        .order_by(desc(CrowdingSnapshotRow.ts))
+        .limit(1)
+    )
+    return db.scalar(stmt)
+
+
+def _is_fresh(row: CrowdingSnapshotRow, min_interval_s: int) -> bool:
+    ts = row.ts
+    if ts is None:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    age_s = (datetime.now(timezone.utc) - ts).total_seconds()
+    return age_s < float(min_interval_s)
+
+
+def _nearest_zone(zones: List[Zone], lat: float, lng: float) -> Tuple[Zone, float]:
+    best: Zone | None = None
+    best_d = 1e18
+
+    for z in zones:
+        zlat = float(z.lat or 0.0)
+        zlng = float(z.lng or 0.0)
+        if zlat == 0.0 and zlng == 0.0:
+            continue
+        d = _haversine_m(lat, lng, zlat, zlng)
+        if d < best_d:
+            best = z
+            best_d = d
+
+    if best is None:
+        raise RuntimeError("No valid zones in DB (coords missing?)")
+
+    return best, float(best_d)
+
+
+def _zone_info_for_point(
+    *,
+    db: Session,
+    zones: List[Zone],
+    lat: float,
+    lng: float,
+    crowding: CrowdingService,
+    min_interval_s: int,
+    snapshot_cache: Dict[str, ZoneInfo],
+) -> tuple[ZoneInfo, bool]:
+    """
+    returns: (ZoneInfo, wrote_snapshot?)
+    """
+    z, dist = _nearest_zone(zones, lat, lng)
+
+    if z.code in snapshot_cache:
+        cached = snapshot_cache[z.code]
+        # distance만 현재 포인트 기준으로 갱신
+        return cached.model_copy(update={"distance_m": float(dist)}), False
+
+    wrote = False
+    latest = _get_latest_snapshot(db, z.code)
+
+    if latest and _is_fresh(latest, min_interval_s):
+        level = latest.level or ""
+        rank = int(latest.rank or 0)
+        msg = latest.message or ""
+        updated = int(latest.updated_at_epoch or 0)
+        raw = latest.raw or {}
+        color = (raw.get("color") or "").strip() or crowding_color(level)
+    else:
+        dto = crowding.get(z.name)
+        level = dto.level
+        rank = int(dto.rank or 0)
+        color = dto.color
+        msg = dto.message
+        updated = int(dto.updated_at_epoch or 0)
+
+        db.add(
+            CrowdingSnapshotRow(
+                zone_code=z.code,
+                level=level,
+                rank=rank,
+                message=msg,
+                updated_at_epoch=updated,
+                raw={"color": color},
+            )
+        )
+        wrote = True
+
+    info = ZoneInfo(
+        code=z.code,
+        name=z.name,
+        lat=float(z.lat),
+        lng=float(z.lng),
+        distance_m=float(dist),
+        crowding_level=level,
+        crowding_rank=rank,
+        crowding_color=color or "unknown",
+        crowding_updated_at=updated,
+        crowding_message=msg or "",
+    )
+
+    snapshot_cache[z.code] = info
+    return info, wrote
 
 
 # -------------------------
@@ -441,17 +426,16 @@ def search_places(
         None,
         description="카테고리 그룹 코드 필터 (카페=CE7, 음식점=FD6)",
     ),
+    prefer_db: int = Query(0, ge=0, le=1, description="1이면 DB(place_cache) 우선 검색(캐시 테스트용)"),
+    response: Response = None,
+    db: Session = Depends(get_db),
 ) -> PlacesSearchResponse:
     """
-    내 위치와 검색어 기준으로 가까운 카페/음식점 리스트를 거리순으로 조회
-
+    1) prefer_db=1이면 DB(place_cache)에서 먼저 검색 (TTL 내 캐시만)
+       - 충분히 나오면 Kakao 호출 없이 반환
+    2) 부족하면 Kakao 호출 -> 결과를 place_cache에 upsert -> 반환
     """
-    try:
-        docs = kakao_keyword_search(query=query, lat=lat, lng=lng, radius_m=radius_m, size=size)
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"places search failed: {e}")
+    cache = PlaceCacheService(db)
 
     valid_scopes = {"cafe", "food", "food_cafe", "all"}
     if scope not in valid_scopes:
@@ -468,19 +452,76 @@ def search_places(
     else:
         allowed = None
 
+    # 1) DB 우선 모드
+    if int(prefer_db) == 1:
+        rows = cache.search_nearby_in_db(
+            query=query,
+            lat=lat,
+            lng=lng,
+            radius_m=int(radius_m),
+            limit=int(size),
+            allowed_category_group_codes=allowed,
+        )
+        if rows:
+            items = []
+            for r, d in rows:
+                items.append(
+                    PlaceItem(
+                        id=r.place_id,
+                        name=r.name or "",
+                        category_name=r.category_name or "",
+                        category_group_code=r.category_group_code or "",
+                        category_group_name=r.category_group_name or "",
+                        phone=r.phone or "",
+                        address_name=r.address_name or "",
+                        road_address_name=r.road_address_name or "",
+                        place_url=r.place_url or "",
+                        image_url="",
+                        lat=float(r.lat or 0.0),
+                        lng=float(r.lng or 0.0),
+                        distance_m=float(round(d, 1)),
+                    )
+                )
+            if response is not None:
+                response.headers["X-Place-Cache"] = f"source=db hits={len(items)} writes=0"
+            return PlacesSearchResponse(items=items)
+        # DB에서 못 찾으면 Kakao로 폴백
+
+    # 2) Kakao 호출
+    try:
+        docs = kakao_keyword_search(query=query, lat=lat, lng=lng, radius_m=radius_m, size=size)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"places search failed: {e}")
+
+    # 카테고리 필터
     if allowed is not None:
         docs = [d for d in docs if (d.get("category_group_code") in allowed)]
 
-    items = [_doc_to_place(d) for d in docs]
+    # DB upsert + 응답 변환
+    wrote = 0
+    items: List[PlaceItem] = []
+    for d in docs:
+        try:
+            if cache.upsert_from_kakao_doc(d):
+                wrote += 1
+        except Exception:
+            # 캐시 실패해도 검색은 성공해야 함
+            pass
+        items.append(_doc_to_place(d))
+
+    if wrote:
+        db.commit()
+
+    if response is not None:
+        response.headers["X-Place-Cache"] = f"source=kakao hits=0 writes={wrote}"
+
     return PlacesSearchResponse(items=items)
 
 
 @router.post("/insight", response_model=PlacesInsightResponse)
-def insight(req: PlacesInsightRequest) -> PlacesInsightResponse:
-    """
-    선택한 가게의 Zone 혼잡도와 덜 붐비는 대체 가게 몇 곳을 함께 조회
-
-    """
+def insight(req: PlacesInsightRequest, db: Session = Depends(get_db)) -> PlacesInsightResponse:
     if req.recommend_from not in {"selected", "user"}:
         raise HTTPException(status_code=400, detail="recommend_from must be 'selected' or 'user'")
 
@@ -501,7 +542,26 @@ def insight(req: PlacesInsightRequest) -> PlacesInsightResponse:
     if not cgc:
         cgc = "CE7"
 
-    selected_zone = _zone_info_for_point(req.selected.lat, req.selected.lng)
+    zones: List[Zone] = list(db.scalars(select(Zone)).all())
+
+    # 10~15분 주기: 기본 600초(10분)
+    min_interval_s = int(os.getenv("CROWDING_SNAPSHOT_MIN_INTERVAL_S", "600"))
+    crowding = CrowdingService()
+
+    snapshot_cache: Dict[str, ZoneInfo] = {}
+    wrote_any = False
+
+    selected_zone, wrote = _zone_info_for_point(
+        db=db,
+        zones=zones,
+        lat=req.selected.lat,
+        lng=req.selected.lng,
+        crowding=crowding,
+        min_interval_s=min_interval_s,
+        snapshot_cache=snapshot_cache,
+    )
+    wrote_any = wrote_any or wrote
+
     selected_place = _maybe_enrich_image(req.selected, req.include_image)
     selected = PlaceWithZone(place=selected_place, zone=selected_zone)
 
@@ -522,13 +582,25 @@ def insight(req: PlacesInsightRequest) -> PlacesInsightResponse:
         p = _doc_to_place(d)
         if not p.id or p.id == req.selected.id:
             continue
+
         p = _maybe_enrich_image(p, req.include_image)
-        z = _zone_info_for_point(p.lat, p.lng)
-        candidates.append(PlaceWithZone(place=p, zone=z))
+
+        zinfo, wrote = _zone_info_for_point(
+            db=db,
+            zones=zones,
+            lat=p.lat,
+            lng=p.lng,
+            crowding=crowding,
+            min_interval_s=min_interval_s,
+            snapshot_cache=snapshot_cache,
+        )
+        wrote_any = wrote_any or wrote
+        candidates.append(PlaceWithZone(place=p, zone=zinfo))
+
+    if wrote_any:
+        db.commit()
 
     # alternatives selection:
-    # 1) 덜 붐비는 것 우선 (rank 높은 것)
-    # 2) 같으면 가까운 것 우선 (place.distance_m: center 기준 distance)
     sel_rank = selected_zone.crowding_rank
     better = [x for x in candidates if x.zone.crowding_rank > sel_rank]
     pool = better if better else candidates
