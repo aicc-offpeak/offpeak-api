@@ -6,122 +6,96 @@
 - 혼잡도 데이터: 서울 열린데이터광장 실시간 도시데이터(citydata_ppltn)
 - 장소 검색/추천: 카카오 로컬 API(키워드/카테고리 검색)
 
-> ✅ 현재 API는 `/v1` prefix 없이 동작합니다.  
-> (예: `/recommendations`, `/places/search`)
-
 ---
 
 ## Requirements
-- Python 3.11+
-- Windows: Git Bash 또는 PowerShell
+
+- Windows 10/11
+- Miniconda(또는 Anaconda) 설치
+- Python 3.11 (conda env로 관리)
+- (DB 사용 시) PostgreSQL 15+ 권장
 
 ---
 
 ## Project Structure
+
 - `app/` : FastAPI app, routes, services, clients
 - `app/resources/zones_seed.json` : 서울 주요 장소(Zone) seed
 - `scripts/` : seed 생성/테스트 스크립트
+- `alembic/` : DB migration
 
 ---
 
-## 1) Setup
+## 1) Setup (Conda)
 
-### Windows PowerShell
-```powershell
-cd C:\boom.b\offpeak-api
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
+### 0) (1회만) conda init
 
-### Git Bash
+Git Bash에서 아래 실행 후 **Git Bash 창을 완전히 종료하고 새로 열어야** 적용됩니다.
+
 ```bash
-cd /c/boom.b/offpeak-api
-python -m venv .venv
-source .venv/Scripts/activate
+conda init bash
+```
+
+## 새 창에서도 conda activate가 안 될 경우(bash)
+
+```bash
+source ~/miniconda3/etc/profile.d/conda.sh
+```
+
+## 2) conda env 생성/활성화 (Python 3.11)
+
+```bash
+conda create -n offpeak-py311 python=3.11 -y
+conda activate offpeak-py311
+python -V
+```
+
+## 3) 패키지 설치
+
+```bash
+cd ~/boom.b/offpeak-api
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-### .env에 아래 값 입력:
-- KAKAO_REST_API_KEY : 카카오 로컬(키워드/카테고리 검색) REST API 키
-- SEOUL_OPENAPI_KEY : 서울 열린데이터광장 "실시간 인구/혼잡도(citydata_ppltn)" 호출 가능한 인증키
-- ZONES_SEED_PATH : 기본값 사용 가능 (app/resources/zones_seed.json)
+## 4) .env 설정 후 로드
 
-✅ .env는 커밋 금지입니다. (.gitignore에 포함)
+```bash
+set -a; source .env; set +a
+```
 
-### Optional env vars (tuning)
+Optional env vars (tuning)
+
 - CROWDING_CACHE_TTL_S : 혼잡도 캐시 TTL(초)
 - TOP_ZONES : 주변 zone 후보 개수
 - PER_ZONE : zone당 추천 POI 개수
 - ZONE_SEARCH_RADIUS_M : zone 중심 기준 POI 검색 반경(m)
 
----
-
-## 2) Run (Git Bash)
+## 4) Run (Git Bash)
 
 ```bash
-cd /c/boom.b/offpeak-api
-source .venv/Scripts/activate
+cd ~/boom.b/offpeak-api
+conda activate offpeak-py311
 set -a; source .env; set +a
+
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
----
+## 5) API Docs / Health
 
-## 3) API Docs / Health
 - Swagger: http://127.0.0.1:8000/docs
 - OpenAPI JSON: http://127.0.0.1:8000/openapi.json
 - Health: http://127.0.0.1:8000/health
 
----
+## 6) Smoke Test (Git Bash) - 서버가 켜진 상태에서 실행
 
-## 4) Quick Test (cURL)
-
-⚠️ Git Bash에서 한글 query는 인코딩 이슈가 있을 수 있습니다.  
-아래 예시는 python으로 URL 인코딩 후 호출합니다.
-
-### 추천(카페)
-```bash
-curl --noproxy "*" -sS \
-"http://127.0.0.1:8000/recommendations?lat=37.5665&lng=126.9780&category=cafe&radius_m=3000&max_results=10" \
-| python -m json.tool
-```
-
-### 추천(음식점)
-```bash
-curl --noproxy "*" -sS \
-"http://127.0.0.1:8000/recommendations?lat=37.5665&lng=126.9780&category=restaurant&radius_m=3000&max_results=10" \
-| python -m json.tool
-```
-
-### 검색 리스트 (가까운 순 5개)
-```bash
-Q=$(python - <<'PY'
-import urllib.parse
-print(urllib.parse.quote("스타벅스"))
-PY
-)
-curl --noproxy "*" -sS \
-"http://127.0.0.1:8000/places/search?query=$Q&lat=37.55687&lng=126.92378&size=5" \
-| python -m json.tool
-```
-
----
-
-## 5) Smoke Test (Git Bash)
-
-서버가 켜진 상태에서 실행:
-```bash
 chmod +x scripts/smoke_test.sh
 ./scripts/smoke_test.sh
-```
 
-Smoke test는 아래를 확인합니다:
-- `/health` 200
-- `/zones/nearby` 200
-- `/recommendations` 200
-- `/places/search` 200
-- `/places/insight` 200
+## 7) Smoke Test Result
 
+- /health 200
+- /zones/nearby 200
+- /recommendations 200
+- /places/search 200
+- /places/insight 200
