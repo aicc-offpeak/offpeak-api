@@ -19,6 +19,8 @@ from app.models import CrowdingSnapshot as CrowdingSnapshotRow
 from app.models import Zone
 from app.services.crowding import CrowdingService, crowding_color
 from app.services.place_cache import PlaceCacheService
+from app.services.place_crowding_snapshot import PlaceCrowdingSnapshotService
+from app.services.place_profile import PlaceProfileService
 
 KAKAO_BASE_URL = "https://dapi.kakao.com"
 router = APIRouter(prefix="/places", tags=["places"])
@@ -119,7 +121,6 @@ def _kakao_rest_key() -> str:
 
 
 def _doc_cgc(d: Dict[str, Any]) -> str:
-    # Kakao 응답이 None/공백일 수 있어서 strip + 안전 처리
     return (d.get("category_group_code") or "").strip().upper()
 
 
@@ -453,7 +454,7 @@ def search_places(
             response.headers["X-PlaceCache-Count"] = str(cache_cnt)
             response.headers["X-PlaceCache-TTL"] = str(cache.ttl_s)
             response.headers["X-App-File"] = __file__
-            response.headers["X-Query"] = quote(q, safe="")  # 한글 안전
+            response.headers["X-Query"] = quote(q, safe="")
         except Exception:
             pass
 
@@ -469,7 +470,6 @@ def search_places(
     else:
         allowed = None
 
-    # 1) cache first
     cached_items: List[PlaceItem] = []
     if scope in ("cache", "all"):
         rows = cache.search_nearby_in_db(
@@ -494,7 +494,6 @@ def search_places(
                         f"combined={debug.get('combined_count', 0)}"
                     )
             except Exception as e:
-                # 에러 메시지(유니코드 포함 가능) 넣지 말고 클래스명만
                 try:
                     response.headers["X-Cache-Debug-Error"] = e.__class__.__name__
                 except Exception:
@@ -510,13 +509,11 @@ def search_places(
             response.headers["X-Place-Cache"] = f"source=cache hits={cache_hits} writes=0"
         return PlacesSearchResponse(items=cached_items[:size])
 
-    # cache is enough => no api call
     if scope == "all" and cache_hits >= size:
         if response is not None:
             response.headers["X-Place-Cache"] = f"source=cache hits={cache_hits} writes=0"
         return PlacesSearchResponse(items=cached_items[:size])
 
-    # 2) api call (need only)
     need = size if scope == "api" else (size - cache_hits)
     try:
         docs = kakao_keyword_search(query=q, lat=lat, lng=lng, radius_m=radius_m, max_results=need)
@@ -531,7 +528,6 @@ def search_places(
         except Exception:
             pass
 
-    # FIX: category_group_code 공백/None 방어 + code 없으면 버리지 않음
     if allowed is not None:
         docs = [d for d in docs if (_doc_cgc(d) in allowed) or (_doc_cgc(d) == "")]
 
@@ -542,7 +538,6 @@ def search_places(
         except Exception:
             pass
 
-    # 3) upsert + response items
     wrote = 0
     seen_ids = {it.id for it in cached_items}
     api_items: List[PlaceItem] = []
@@ -578,7 +573,11 @@ def search_places(
 
 
 @router.post("/insight", response_model=PlacesInsightResponse)
-def insight(req: PlacesInsightRequest, db: Session = Depends(get_db)) -> PlacesInsightResponse:
+def insight(
+    req: PlacesInsightRequest,
+    response: Response = None,
+    db: Session = Depends(get_db),
+) -> PlacesInsightResponse:
     if req.recommend_from not in {"selected", "user"}:
         raise HTTPException(status_code=400, detail="recommend_from must be 'selected' or 'user'")
 
@@ -589,7 +588,6 @@ def insight(req: PlacesInsightRequest, db: Session = Depends(get_db)) -> PlacesI
         center_lat = float(req.selected.lat)
         center_lng = float(req.selected.lng)
 
-    # category_group_code 결정
     cgc = (req.selected.category_group_code or "").strip()
     if req.category:
         if req.category.lower() == "cafe":
@@ -600,10 +598,136 @@ def insight(req: PlacesInsightRequest, db: Session = Depends(get_db)) -> PlacesI
         cgc = "CE7"
 
     zones: List[Zone] = list(db.scalars(select(Zone)).all())
-
     min_interval_s = int(os.getenv("CROWDING_SNAPSHOT_MIN_INTERVAL_S", "600"))
     crowding = CrowdingService()
 
+    # -------------------------
+    # Place snapshot helpers (ORM + fallback raw SQL)
+    # -------------------------
+    place_snap = PlaceCrowdingSnapshotService(db)
+    place_snap_dirty = False
+    place_snap_selected_added = 0
+    place_snap_candidate_added = 0
+    place_snap_err: str = ""
+
+    def _now_utc() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _is_fresh_ts(ts: Optional[datetime], min_interval_s: int) -> bool:
+        if ts is None:
+            return False
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age_s = (_now_utc() - ts.astimezone(timezone.utc)).total_seconds()
+        return age_s < float(min_interval_s)
+
+    def _raw_latest_ts(place_id: str) -> Optional[datetime]:
+        return db.execute(
+            text(
+                """
+                select ts
+                from place_crowding_snapshots
+                where place_id = :pid
+                order by ts desc
+                limit 1
+                """
+            ),
+            {"pid": place_id},
+        ).scalar()
+
+    def _raw_insert(**params: Any) -> bool:
+        # NOTE: 컬럼명이 migration과 다르면 여기서 오류가 나고 header로 드러남
+        db.execute(
+            text(
+                """
+                insert into place_crowding_snapshots
+                (place_id, place_name, category_group_code, lat, lng,
+                 zone_code, zone_distance_m, level, rank, message, updated_at_epoch, raw)
+                values
+                (:place_id, :place_name, :category_group_code, :lat, :lng,
+                 :zone_code, :zone_distance_m, :level, :rank, :message, :updated_at_epoch, :raw)
+                """
+            ),
+            params,
+        )
+        return True
+
+    def _record_place_snapshot(
+        *,
+        place_id: str,
+        place_name: str | None,
+        category_group_code: str | None,
+        lat: float | None,
+        lng: float | None,
+        zone_code: str,
+        zone_distance_m: float | None,
+        level: str,
+        rank: int,
+        message: str,
+        updated_at_epoch: int,
+        raw: dict[str, Any] | None,
+    ) -> bool:
+        nonlocal place_snap_err
+
+        pid = (place_id or "").strip()
+        if not pid:
+            return False
+
+        # 1) ORM 방식 (서비스 재사용)
+        try:
+            with db.begin_nested():
+                did_add = place_snap.record(
+                    place_id=pid,
+                    place_name=place_name,
+                    category_group_code=category_group_code,
+                    lat=lat,
+                    lng=lng,
+                    zone_code=zone_code,
+                    zone_distance_m=zone_distance_m,
+                    level=level,
+                    rank=int(rank or 0),
+                    message=message,
+                    updated_at_epoch=int(updated_at_epoch or 0),
+                    raw=raw,
+                )
+                if did_add:
+                    db.flush()  # 여기서 스키마/테이블 문제면 바로 터짐
+            return bool(did_add)
+        except Exception as e:
+            place_snap_err = e.__class__.__name__
+
+        # 2) fallback raw SQL (테이블/컬럼이 실제로 존재하면 insert라도 되게)
+        try:
+            latest = _raw_latest_ts(pid)
+            min_s = int(os.getenv("PLACE_CROWDING_SNAPSHOT_MIN_INTERVAL_S", "1800"))
+            if _is_fresh_ts(latest, min_s):
+                return False
+
+            with db.begin_nested():
+                _raw_insert(
+                    place_id=pid,
+                    place_name=place_name,
+                    category_group_code=category_group_code,
+                    lat=lat,
+                    lng=lng,
+                    zone_code=zone_code,
+                    zone_distance_m=zone_distance_m,
+                    level=level or "",
+                    rank=int(rank or 0),
+                    message=message or "",
+                    updated_at_epoch=int(updated_at_epoch or 0),
+                    raw=raw,
+                )
+                db.flush()
+            return True
+        except Exception as e2:
+            # 두 단계 모두 실패하면 "A->B" 형태로 남김 (헤더 ASCII OK)
+            place_snap_err = f"{place_snap_err}->{e2.__class__.__name__}" if place_snap_err else e2.__class__.__name__
+            return False
+
+    # -------------------------
+    # zone snapshot
+    # -------------------------
     snapshot_cache: Dict[str, ZoneInfo] = {}
     wrote_any = False
     cache_dirty = False
@@ -622,10 +746,36 @@ def insight(req: PlacesInsightRequest, db: Session = Depends(get_db)) -> PlacesI
     selected_place = _maybe_enrich_image(req.selected, req.include_image)
     selected = PlaceWithZone(place=selected_place, zone=selected_zone)
 
+    # -------------------------
+    # Record selected snapshot
+    # -------------------------
+    try:
+        did = _record_place_snapshot(
+            place_id=req.selected.id,
+            place_name=req.selected.name,
+            category_group_code=req.selected.category_group_code,
+            lat=float(req.selected.lat),
+            lng=float(req.selected.lng),
+            zone_code=selected_zone.code,
+            zone_distance_m=float(selected_zone.distance_m),
+            level=selected_zone.crowding_level,
+            rank=int(selected_zone.crowding_rank or 0),
+            message=selected_zone.crowding_message,
+            updated_at_epoch=int(selected_zone.crowding_updated_at or 0),
+            raw={"color": selected_zone.crowding_color, "source": "zone"},
+        )
+        if did:
+            place_snap_dirty = True
+            place_snap_selected_added += 1
+    except Exception as e:
+        place_snap_err = e.__class__.__name__
+
+    # -------------------------
+    # candidate fetching (cache -> api)
+    # -------------------------
     place_cache = PlaceCacheService(db)
     ttl_s = int(os.getenv("PLACE_CACHE_TTL_S", "86400"))
 
-    # 1) cache first
     cached = place_cache.get_cached_places_near(
         lat=center_lat,
         lng=center_lng,
@@ -673,6 +823,9 @@ def insight(req: PlacesInsightRequest, db: Session = Depends(get_db)) -> PlacesI
             except Exception:
                 pass
 
+    # -------------------------
+    # build candidates + record snapshots
+    # -------------------------
     candidates: List[PlaceWithZone] = []
     for d in docs:
         p = _doc_to_place(d)
@@ -691,10 +844,54 @@ def insight(req: PlacesInsightRequest, db: Session = Depends(get_db)) -> PlacesI
             snapshot_cache=snapshot_cache,
         )
         wrote_any = wrote_any or wrote
+
+        try:
+            did = _record_place_snapshot(
+                place_id=p.id,
+                place_name=p.name,
+                category_group_code=p.category_group_code,
+                lat=float(p.lat),
+                lng=float(p.lng),
+                zone_code=zinfo.code,
+                zone_distance_m=float(zinfo.distance_m),
+                level=zinfo.crowding_level,
+                rank=int(zinfo.crowding_rank or 0),
+                message=zinfo.crowding_message,
+                updated_at_epoch=int(zinfo.crowding_updated_at or 0),
+                raw={"color": zinfo.crowding_color, "source": "zone"},
+            )
+            if did:
+                place_snap_dirty = True
+                place_snap_candidate_added += 1
+        except Exception as e:
+            place_snap_err = e.__class__.__name__
+
         candidates.append(PlaceWithZone(place=p, zone=zinfo))
 
-    if wrote_any or cache_dirty:
-        db.commit()
+    # -------------------------
+    # commit
+    # -------------------------
+    committed = False
+    if wrote_any or cache_dirty or place_snap_dirty:
+        try:
+            db.commit()
+            committed = True
+        except Exception as e:
+            db.rollback()
+            place_snap_err = place_snap_err or e.__class__.__name__
+
+    # -------------------------
+    # debug headers
+    # -------------------------
+    if response is not None:
+        try:
+            response.headers["X-PlaceSnap-Selected-Added"] = str(place_snap_selected_added)
+            response.headers["X-PlaceSnap-Candidate-Added"] = str(place_snap_candidate_added)
+            response.headers["X-PlaceSnap-Dirty"] = "1" if place_snap_dirty else "0"
+            response.headers["X-PlaceSnap-Commit"] = "1" if committed else "0"
+            response.headers["X-PlaceSnap-Err"] = (place_snap_err or "")
+        except Exception:
+            pass
 
     sel_rank = selected_zone.crowding_rank
     better = [x for x in candidates if x.zone.crowding_rank > sel_rank]
@@ -704,3 +901,35 @@ def insight(req: PlacesInsightRequest, db: Session = Depends(get_db)) -> PlacesI
     alternatives = pool[: int(max(0, req.max_alternatives))]
 
     return PlacesInsightResponse(selected=selected, alternatives=alternatives)
+
+@router.get("/profile")
+def place_profile(
+    place_id: str = Query(..., description="Kakao place id"),
+    days: Optional[int] = Query(None, ge=1, le=365, description="최근 N일만 집계(옵션)"),
+    min_samples: int = Query(3, ge=1, le=100, description="셀당 최소 샘플 수"),
+    db: Session = Depends(get_db),
+):
+    svc = PlaceProfileService(db)
+    return svc.weekly_hourly_profile(place_id=place_id, days=days, min_samples=min_samples)
+
+@router.get("/recommend_times")
+def recommend_times(
+    place_id: str = Query(...),
+    days: int = Query(30, ge=1, le=365),
+    min_samples: int = Query(3, ge=1, le=100),
+    per_day: int = Query(3, ge=1, le=10),
+    window_h: int = Query(2, ge=1, le=6),
+    include_low_samples: bool = Query(False),
+    fallback_to_hourly: bool = Query(True),  
+    db: Session = Depends(get_db),
+):
+    svc = PlaceProfileService(db)
+    return svc.recommend_quiet_times(
+        place_id=place_id,
+        days=days,
+        min_samples=min_samples,
+        per_day=per_day,
+        window_h=window_h,
+        include_low_samples=include_low_samples,
+        fallback_to_hourly=fallback_to_hourly, 
+    )
