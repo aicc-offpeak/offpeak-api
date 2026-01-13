@@ -3,7 +3,18 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+# 프로젝트 루트를 Python 경로에 추가
+project_root = Path(__file__).parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+# .env 파일 로드
+load_dotenv(dotenv_path=project_root / ".env", override=True)
 
 from sqlalchemy import select
 
