@@ -4,19 +4,20 @@ import math
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
+from urllib.parse import quote
 
 import httpx
 from cachetools import TTLCache
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, text
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models import CrowdingSnapshot as CrowdingSnapshotRow
 from app.models import Zone
-from app.services.crowding import CrowdingService, crowding_color, crowding_rank
+from app.services.crowding import CrowdingService, crowding_color
 from app.services.place_cache import PlaceCacheService
 
 KAKAO_BASE_URL = "https://dapi.kakao.com"
@@ -117,6 +118,11 @@ def _kakao_rest_key() -> str:
     return rest_key
 
 
+def _doc_cgc(d: Dict[str, Any]) -> str:
+    # Kakao 응답이 None/공백일 수 있어서 strip + 안전 처리
+    return (d.get("category_group_code") or "").strip().upper()
+
+
 # -------------------------
 # Kakao local calls
 # -------------------------
@@ -126,71 +132,61 @@ def kakao_keyword_search(
     lat: float,
     lng: float,
     radius_m: int,
-    size: int,
+    max_results: int,
 ) -> List[Dict[str, Any]]:
     url = f"{KAKAO_BASE_URL}/v2/local/search/keyword.json"
     headers = {"Authorization": f"KakaoAK {_kakao_rest_key()}"}
 
-    radius_m = int(max(0, min(radius_m, 20000)))
-    size = int(max(1, min(size, 15)))
-
-    params = {
-        "query": query,
-        "x": f"{lng:.7f}",
-        "y": f"{lat:.7f}",
-        "radius": radius_m,
-        "size": size,
-        "sort": "distance",
-        "page": 1,
-    }
-
-    with httpx.Client(timeout=8.0, trust_env=False) as client:
-        r = client.get(url, headers=headers, params=params)
-
-    if r.status_code != 200:
-        raise RuntimeError(f"Kakao keyword search failed: {r.status_code} {r.text}")
-
-    data = r.json()
-    return data.get("documents") or []
-
-
-def kakao_category_search_page(
-    *,
-    category_group_code: str,
-    lat: float,
-    lng: float,
-    radius_m: int,
-    size: int,
-    page: int,
-) -> tuple[List[Dict[str, Any]], bool]:
-    url = f"{KAKAO_BASE_URL}/v2/local/search/category.json"
-    headers = {"Authorization": f"KakaoAK {_kakao_rest_key()}"}
+    q = (query or "").strip()
+    if not q:
+        return []
 
     radius_m = int(max(0, min(radius_m, 20000)))
-    size = int(max(1, min(size, 15)))
-    page = int(max(1, min(page, 45)))
+    max_results = int(max(1, min(max_results, 45)))
 
-    params = {
-        "category_group_code": category_group_code,
-        "x": f"{lng:.7f}",
-        "y": f"{lat:.7f}",
-        "radius": radius_m,
-        "size": size,
-        "sort": "distance",
-        "page": page,
-    }
+    docs_all: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    page = 1
 
-    with httpx.Client(timeout=8.0, trust_env=False) as client:
-        r = client.get(url, headers=headers, params=params)
+    while len(docs_all) < max_results and page <= 45:
+        remaining = max_results - len(docs_all)
+        size = min(15, remaining)
 
-    if r.status_code != 200:
-        raise RuntimeError(f"Kakao category search failed: {r.status_code} {r.text}")
+        params = {
+            "query": q,
+            "x": f"{lng:.7f}",
+            "y": f"{lat:.7f}",
+            "radius": radius_m,
+            "size": size,
+            "sort": "distance",
+            "page": page,
+        }
 
-    data = r.json()
-    docs = data.get("documents") or []
-    meta = data.get("meta") or {}
-    is_end = bool(meta.get("is_end", True))
-    return docs, is_end
+        with httpx.Client(timeout=8.0, trust_env=False) as client:
+            r = client.get(url, headers=headers, params=params)
+
+        if r.status_code != 200:
+            raise RuntimeError(f"Kakao keyword search failed: {r.status_code} {r.text}")
+
+        data = r.json()
+        docs = data.get("documents") or []
+        meta = data.get("meta") or {}
+        is_end = bool(meta.get("is_end", True))
+
+        for d in docs:
+            pid = str(d.get("id") or "").strip()
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            docs_all.append(d)
+            if len(docs_all) >= max_results:
+                break
+
+        if is_end:
+            break
+        page += 1
+
+    return docs_all
 
 
 def kakao_category_search(
@@ -201,29 +197,46 @@ def kakao_category_search(
     radius_m: int,
     max_results: int,
 ) -> List[Dict[str, Any]]:
-    max_results = int(max(1, min(max_results, 45)))
-    docs_all: List[Dict[str, Any]] = []
-    seen_ids: set[str] = set()
+    url = f"{KAKAO_BASE_URL}/v2/local/search/category.json"
+    headers = {"Authorization": f"KakaoAK {_kakao_rest_key()}"}
 
+    radius_m = int(max(0, min(radius_m, 20000)))
+    max_results = int(max(1, min(max_results, 45)))
+
+    docs_all: List[Dict[str, Any]] = []
+    seen: set[str] = set()
     page = 1
+
     while len(docs_all) < max_results and page <= 45:
         remaining = max_results - len(docs_all)
-        page_size = min(15, remaining)
+        size = min(15, remaining)
 
-        docs, is_end = kakao_category_search_page(
-            category_group_code=category_group_code,
-            lat=lat,
-            lng=lng,
-            radius_m=radius_m,
-            size=page_size,
-            page=page,
-        )
+        params = {
+            "category_group_code": category_group_code,
+            "x": f"{lng:.7f}",
+            "y": f"{lat:.7f}",
+            "radius": radius_m,
+            "size": size,
+            "sort": "distance",
+            "page": page,
+        }
+
+        with httpx.Client(timeout=8.0, trust_env=False) as client:
+            r = client.get(url, headers=headers, params=params)
+
+        if r.status_code != 200:
+            raise RuntimeError(f"Kakao category search failed: {r.status_code} {r.text}")
+
+        data = r.json()
+        docs = data.get("documents") or []
+        meta = data.get("meta") or {}
+        is_end = bool(meta.get("is_end", True))
 
         for d in docs:
-            pid = _safe_str(d.get("id"))
-            if not pid or pid in seen_ids:
+            pid = str(d.get("id") or "").strip()
+            if not pid or pid in seen:
                 continue
-            seen_ids.add(pid)
+            seen.add(pid)
             docs_all.append(d)
             if len(docs_all) >= max_results:
                 break
@@ -238,7 +251,7 @@ def kakao_category_search(
 def _doc_to_place(d: Dict[str, Any]) -> PlaceItem:
     return PlaceItem(
         id=_safe_str(d.get("id")),
-        name=_safe_str(d.get("place_name")),
+        name=_safe_str(d.get("place_name") or d.get("name")),
         category_name=_safe_str(d.get("category_name")),
         category_group_code=_safe_str(d.get("category_group_code")),
         category_group_name=_safe_str(d.get("category_group_name")),
@@ -247,14 +260,14 @@ def _doc_to_place(d: Dict[str, Any]) -> PlaceItem:
         road_address_name=_safe_str(d.get("road_address_name")),
         place_url=_safe_str(d.get("place_url")),
         image_url="",
-        lat=_safe_float(d.get("y")),
-        lng=_safe_float(d.get("x")),
-        distance_m=_safe_float(d.get("distance")),
+        lat=_safe_float(d.get("y") or d.get("lat")),
+        lng=_safe_float(d.get("x") or d.get("lng")),
+        distance_m=_safe_float(d.get("distance") or d.get("distance_m")),
     )
 
 
 # -------------------------
-# place_url -> og:image
+# place_url -> og:image (optional)
 # -------------------------
 _image_cache = TTLCache(maxsize=1024, ttl=int(os.getenv("PLACE_IMAGE_CACHE_TTL_S", "3600") or "3600"))
 _OG_IMAGE_RE = re.compile(
@@ -311,7 +324,7 @@ def _get_latest_snapshot(db: Session, zone_code: str) -> CrowdingSnapshotRow | N
     return db.scalar(stmt)
 
 
-def _is_fresh(row: CrowdingSnapshotRow, min_interval_s: int) -> bool:
+def _is_snapshot_fresh(row: CrowdingSnapshotRow, min_interval_s: int) -> bool:
     ts = row.ts
     if ts is None:
         return False
@@ -351,20 +364,16 @@ def _zone_info_for_point(
     min_interval_s: int,
     snapshot_cache: Dict[str, ZoneInfo],
 ) -> tuple[ZoneInfo, bool]:
-    """
-    returns: (ZoneInfo, wrote_snapshot?)
-    """
     z, dist = _nearest_zone(zones, lat, lng)
 
     if z.code in snapshot_cache:
         cached = snapshot_cache[z.code]
-        # distance만 현재 포인트 기준으로 갱신
         return cached.model_copy(update={"distance_m": float(dist)}), False
 
     wrote = False
     latest = _get_latest_snapshot(db, z.code)
 
-    if latest and _is_fresh(latest, min_interval_s):
+    if latest and _is_snapshot_fresh(latest, min_interval_s):
         level = latest.level or ""
         rank = int(latest.rank or 0)
         msg = latest.message or ""
@@ -372,7 +381,7 @@ def _zone_info_for_point(
         raw = latest.raw or {}
         color = (raw.get("color") or "").strip() or crowding_color(level)
     else:
-        dto = crowding.get(z.name)
+        dto = crowding.get(area_name=z.name, area_code=z.code)
         level = dto.level
         rank = int(dto.rank or 0)
         color = dto.color
@@ -386,7 +395,7 @@ def _zone_info_for_point(
                 rank=rank,
                 message=msg,
                 updated_at_epoch=updated,
-                raw={"color": color},
+                raw={"color": color, "seoul": dto.raw},
             )
         )
         wrote = True
@@ -411,113 +420,161 @@ def _zone_info_for_point(
 # -------------------------
 # Endpoints
 # -------------------------
+SearchScope = Literal["cache", "api", "all"]
+CategoryScope = Literal["cafe", "food", "food_cafe", "all"]
+
+
 @router.get("/search", response_model=PlacesSearchResponse)
 def search_places(
     query: str = Query(..., min_length=1, description="검색어(예: 스타벅스)"),
     lat: float = Query(..., ge=-90, le=90, description="현재 위도"),
     lng: float = Query(..., ge=-180, le=180, description="현재 경도"),
-    size: int = Query(5, ge=1, le=15, description="가까운 순 결과 개수(기본 5)"),
+    size: int = Query(15, ge=1, le=45, description="가까운 순 결과 개수(기본 15, 최대 45)"),
     radius_m: int = Query(3000, ge=0, le=20000, description="검색 반경(m) (기본 3000)"),
-    scope: str = Query(
-        "food_cafe",
-        description="검색 스코프: cafe(카페), food(음식점), food_cafe(기본), all(필터 없음)",
-    ),
-    category_group_code: Optional[str] = Query(
-        None,
-        description="카테고리 그룹 코드 필터 (카페=CE7, 음식점=FD6)",
-    ),
-    prefer_db: int = Query(0, ge=0, le=1, description="1이면 DB(place_cache) 우선 검색(캐시 테스트용)"),
+    scope: SearchScope = Query("all", description="cache | api | all"),
+    category_scope: CategoryScope = Query("food_cafe", description="cafe | food | food_cafe | all"),
+    category_group_code: Optional[str] = Query(None, description="카테고리 그룹 코드(CE7, FD6)"),
     response: Response = None,
     db: Session = Depends(get_db),
 ) -> PlacesSearchResponse:
-    """
-    1) prefer_db=1이면 DB(place_cache)에서 먼저 검색 (TTL 내 캐시만)
-       - 충분히 나오면 Kakao 호출 없이 반환
-    2) 부족하면 Kakao 호출 -> 결과를 place_cache에 upsert -> 반환
-    """
+    q = (query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="query is required")
+
+    size = int(max(1, min(size, 45)))
     cache = PlaceCacheService(db)
 
-    valid_scopes = {"cafe", "food", "food_cafe", "all"}
-    if scope not in valid_scopes:
-        raise HTTPException(status_code=400, detail=f"invalid scope: {scope}")
+    # DEBUG headers (ASCII only)
+    if response is not None:
+        try:
+            db_name = db.execute(text("select current_database()")).scalar()
+            cache_cnt = db.execute(text("select count(*) from place_cache")).scalar()
+            response.headers["X-DB"] = str(db_name)
+            response.headers["X-PlaceCache-Count"] = str(cache_cnt)
+            response.headers["X-PlaceCache-TTL"] = str(cache.ttl_s)
+            response.headers["X-App-File"] = __file__
+            response.headers["X-Query"] = quote(q, safe="")  # 한글 안전
+        except Exception:
+            pass
 
+    # category filter
     if category_group_code:
-        allowed = {category_group_code}
-    elif scope == "cafe":
+        allowed = {(category_group_code or "").strip().upper()}
+    elif category_scope == "cafe":
         allowed = {"CE7"}
-    elif scope == "food":
+    elif category_scope == "food":
         allowed = {"FD6"}
-    elif scope == "food_cafe":
+    elif category_scope == "food_cafe":
         allowed = {"CE7", "FD6"}
     else:
         allowed = None
 
-    # 1) DB 우선 모드
-    if int(prefer_db) == 1:
+    # 1) cache first
+    cached_items: List[PlaceItem] = []
+    if scope in ("cache", "all"):
         rows = cache.search_nearby_in_db(
-            query=query,
+            query=q,
             lat=lat,
             lng=lng,
             radius_m=int(radius_m),
-            limit=int(size),
+            limit=size,
             allowed_category_group_codes=allowed,
         )
-        if rows:
-            items = []
-            for r, d in rows:
-                items.append(
-                    PlaceItem(
-                        id=r.place_id,
-                        name=r.name or "",
-                        category_name=r.category_name or "",
-                        category_group_code=r.category_group_code or "",
-                        category_group_name=r.category_group_name or "",
-                        phone=r.phone or "",
-                        address_name=r.address_name or "",
-                        road_address_name=r.road_address_name or "",
-                        place_url=r.place_url or "",
-                        image_url="",
-                        lat=float(r.lat or 0.0),
-                        lng=float(r.lng or 0.0),
-                        distance_m=float(round(d, 1)),
-                    )
-                )
-            if response is not None:
-                response.headers["X-Place-Cache"] = f"source=db hits={len(items)} writes=0"
-            return PlacesSearchResponse(items=items)
-        # DB에서 못 찾으면 Kakao로 폴백
 
-    # 2) Kakao 호출
+        if response is not None:
+            try:
+                response.headers["X-Cache-DBRows"] = str(len(rows))
+                if cache._last_debug_info:
+                    debug = cache._last_debug_info
+                    response.headers["X-Cache-Debug"] = (
+                        f"total={debug.get('total_count', 0)} "
+                        f"fresh={debug.get('fresh_count', 0)} "
+                        f"name_match={debug.get('name_match_count', 0)} "
+                        f"bbox={debug.get('bbox_count', 0)} "
+                        f"combined={debug.get('combined_count', 0)}"
+                    )
+            except Exception as e:
+                # 에러 메시지(유니코드 포함 가능) 넣지 말고 클래스명만
+                try:
+                    response.headers["X-Cache-Debug-Error"] = e.__class__.__name__
+                except Exception:
+                    pass
+
+        for r, d in rows:
+            cached_items.append(PlaceItem(**cache.row_to_place_dict(r, distance_m=d)))
+
+    cache_hits = len(cached_items)
+
+    if scope == "cache":
+        if response is not None:
+            response.headers["X-Place-Cache"] = f"source=cache hits={cache_hits} writes=0"
+        return PlacesSearchResponse(items=cached_items[:size])
+
+    # cache is enough => no api call
+    if scope == "all" and cache_hits >= size:
+        if response is not None:
+            response.headers["X-Place-Cache"] = f"source=cache hits={cache_hits} writes=0"
+        return PlacesSearchResponse(items=cached_items[:size])
+
+    # 2) api call (need only)
+    need = size if scope == "api" else (size - cache_hits)
     try:
-        docs = kakao_keyword_search(query=query, lat=lat, lng=lng, radius_m=radius_m, size=size)
+        docs = kakao_keyword_search(query=q, lat=lat, lng=lng, radius_m=radius_m, max_results=need)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"places search failed: {e}")
 
-    # 카테고리 필터
-    if allowed is not None:
-        docs = [d for d in docs if (d.get("category_group_code") in allowed)]
+    if response is not None:
+        try:
+            response.headers["X-Kakao-Docs-Raw"] = str(len(docs))
+        except Exception:
+            pass
 
-    # DB upsert + 응답 변환
+    # FIX: category_group_code 공백/None 방어 + code 없으면 버리지 않음
+    if allowed is not None:
+        docs = [d for d in docs if (_doc_cgc(d) in allowed) or (_doc_cgc(d) == "")]
+
+    if response is not None:
+        try:
+            response.headers["X-Kakao-Docs-AfterFilter"] = str(len(docs))
+            response.headers["X-Kakao-Allowed"] = ",".join(sorted(allowed)) if allowed else ""
+        except Exception:
+            pass
+
+    # 3) upsert + response items
     wrote = 0
-    items: List[PlaceItem] = []
+    seen_ids = {it.id for it in cached_items}
+    api_items: List[PlaceItem] = []
+
     for d in docs:
+        pid = _safe_str(d.get("id"))
+        if not pid or pid in seen_ids:
+            continue
+        seen_ids.add(pid)
+
         try:
             if cache.upsert_from_kakao_doc(d):
                 wrote += 1
         except Exception:
-            # 캐시 실패해도 검색은 성공해야 함
             pass
-        items.append(_doc_to_place(d))
+
+        api_items.append(_doc_to_place(d))
+        if len(api_items) >= need:
+            break
 
     if wrote:
         db.commit()
 
-    if response is not None:
-        response.headers["X-Place-Cache"] = f"source=kakao hits=0 writes={wrote}"
+    if scope == "api":
+        if response is not None:
+            response.headers["X-Place-Cache"] = f"source=api hits=0 writes={wrote}"
+        return PlacesSearchResponse(items=api_items[:size])
 
-    return PlacesSearchResponse(items=items)
+    merged = (cached_items + api_items)[:size]
+    if response is not None:
+        response.headers["X-Place-Cache"] = f"source=merged hits={cache_hits} writes={wrote}"
+    return PlacesSearchResponse(items=merged)
 
 
 @router.post("/insight", response_model=PlacesInsightResponse)
@@ -544,12 +601,12 @@ def insight(req: PlacesInsightRequest, db: Session = Depends(get_db)) -> PlacesI
 
     zones: List[Zone] = list(db.scalars(select(Zone)).all())
 
-    # 10~15분 주기: 기본 600초(10분)
     min_interval_s = int(os.getenv("CROWDING_SNAPSHOT_MIN_INTERVAL_S", "600"))
     crowding = CrowdingService()
 
     snapshot_cache: Dict[str, ZoneInfo] = {}
     wrote_any = False
+    cache_dirty = False
 
     selected_zone, wrote = _zone_info_for_point(
         db=db,
@@ -565,17 +622,56 @@ def insight(req: PlacesInsightRequest, db: Session = Depends(get_db)) -> PlacesI
     selected_place = _maybe_enrich_image(req.selected, req.include_image)
     selected = PlaceWithZone(place=selected_place, zone=selected_zone)
 
-    # candidates
-    try:
-        docs = kakao_category_search(
-            category_group_code=cgc,
-            lat=center_lat,
-            lng=center_lng,
-            radius_m=int(req.radius_m),
-            max_results=int(req.max_candidates),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"insight candidate search failed: {e}")
+    place_cache = PlaceCacheService(db)
+    ttl_s = int(os.getenv("PLACE_CACHE_TTL_S", "86400"))
+
+    # 1) cache first
+    cached = place_cache.get_cached_places_near(
+        lat=center_lat,
+        lng=center_lng,
+        radius_m=int(req.radius_m),
+        category_group_code=cgc,
+        limit=int(req.max_candidates),
+        ttl_s=ttl_s,
+    )
+
+    docs: List[Dict[str, Any]] = []
+    if len(cached) >= int(req.max_candidates):
+        for item in cached:
+            docs.append(
+                {
+                    "id": item.get("id"),
+                    "place_name": item.get("name"),
+                    "category_name": item.get("category_name"),
+                    "category_group_code": item.get("category_group_code"),
+                    "category_group_name": item.get("category_group_name"),
+                    "phone": item.get("phone"),
+                    "address_name": item.get("address_name"),
+                    "road_address_name": item.get("road_address_name"),
+                    "place_url": item.get("place_url"),
+                    "y": item.get("lat"),
+                    "x": item.get("lng"),
+                    "distance": item.get("distance_m"),
+                }
+            )
+    else:
+        try:
+            docs = kakao_category_search(
+                category_group_code=cgc,
+                lat=center_lat,
+                lng=center_lng,
+                radius_m=int(req.radius_m),
+                max_results=int(req.max_candidates),
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"insight candidate search failed: {e}")
+
+        for d in docs:
+            try:
+                if place_cache.upsert_from_kakao_doc(d):
+                    cache_dirty = True
+            except Exception:
+                pass
 
     candidates: List[PlaceWithZone] = []
     for d in docs:
@@ -597,10 +693,9 @@ def insight(req: PlacesInsightRequest, db: Session = Depends(get_db)) -> PlacesI
         wrote_any = wrote_any or wrote
         candidates.append(PlaceWithZone(place=p, zone=zinfo))
 
-    if wrote_any:
+    if wrote_any or cache_dirty:
         db.commit()
 
-    # alternatives selection:
     sel_rank = selected_zone.crowding_rank
     better = [x for x in candidates if x.zone.crowding_rank > sel_rank]
     pool = better if better else candidates
