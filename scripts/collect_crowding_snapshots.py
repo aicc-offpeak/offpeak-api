@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, func
 
 # ---------------------------------
 # Path + .env (MUST be before app imports)
@@ -32,16 +32,6 @@ def _is_fresh(ts: datetime, min_interval_s: int) -> bool:
     return age_s < float(min_interval_s)
 
 
-def _get_latest_snapshot_ts(db, zone_code: str) -> datetime | None:
-    stmt = (
-        select(CrowdingSnapshotModel.ts)
-        .where(CrowdingSnapshotModel.zone_code == zone_code)
-        .order_by(desc(CrowdingSnapshotModel.ts))
-        .limit(1)
-    )
-    return db.scalar(stmt)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=120)
@@ -62,40 +52,60 @@ def main() -> None:
 
     with SessionLocal() as db:
         zones = list(db.scalars(select(Zone).order_by(Zone.code).limit(int(args.limit))).all())
+        zone_codes = [z.code for z in zones]
         print(f"[collect] zones_to_check={len(zones)} min_interval_s={args.min_interval_s} dry_run={args.dry_run}")
+
+        # 1) 최신 스냅샷 ts를 zone별로 한 번에 가져오기 (N번 SELECT -> 1번)
+        latest_rows = db.execute(
+            select(
+                CrowdingSnapshotModel.zone_code,
+                func.max(CrowdingSnapshotModel.ts).label("max_ts"),
+            )
+            .where(CrowdingSnapshotModel.zone_code.in_(zone_codes))
+            .group_by(CrowdingSnapshotModel.zone_code)
+        ).all()
+        latest_map = {zc: ts for (zc, ts) in latest_rows}
 
         for z in zones:
             try:
-                latest_ts = _get_latest_snapshot_ts(db, z.code)
+                latest_ts = latest_map.get(z.code)
                 if latest_ts and _is_fresh(latest_ts, int(args.min_interval_s)):
                     skipped += 1
                     continue
 
-                # FIX: keyword call (area_code + area_name)
                 dto = crowding.get(area_code=z.code, area_name=z.name)
 
                 if args.dry_run:
                     print(f"[dry] zone={z.code} name={z.name} level={dto.level} rank={dto.rank}")
                     continue
 
-                db.add(
-                    CrowdingSnapshotModel(
-                        zone_code=z.code,
-                        level=dto.level,
-                        rank=int(dto.rank or 0),
-                        message=dto.message,
-                        updated_at_epoch=int(dto.updated_at_epoch or 0),
-                        raw={"color": dto.color, "seoul": dto.raw},
+                # 2) zone 단위 savepoint(부분 롤백)로 안정성 확보
+                with db.begin_nested():
+                    db.add(
+                        CrowdingSnapshotModel(
+                            zone_code=z.code,
+                            level=dto.level,
+                            rank=int(dto.rank or 0),
+                            message=dto.message,
+                            updated_at_epoch=int(dto.updated_at_epoch or 0),
+                            raw={"color": dto.color, "seoul": dto.raw},
+                        )
                     )
-                )
-                db.commit()
+
                 wrote += 1
-                print(f"[ok] inserted snapshot: zone={z.code} name={z.name} level={dto.level} rank={dto.rank}")
+                print(f"[ok] staged snapshot: zone={z.code} name={z.name} level={dto.level} rank={dto.rank}")
 
             except Exception as e:
-                db.rollback()
+                # begin_nested() 안에서 실패하면 그 부분만 롤백되고 계속 진행됨
                 errors += 1
                 print(f"[err] zone={z.code} name={z.name} -> {e}")
+
+        # 3) 마지막에 한 번만 commit (속도↑)
+        if not args.dry_run:
+            if wrote:
+                db.commit()
+            else:
+                db.rollback()
 
     print(f"[done] wrote={wrote} skipped={skipped} errors={errors}")
 
