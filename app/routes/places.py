@@ -915,21 +915,23 @@ def place_profile(
 @router.get("/recommend_times")
 def recommend_times(
     place_id: str = Query(...),
-    days: int = Query(30, ge=1, le=365),
+    days: int = Query(7, ge=1, le=365),
     min_samples: int = Query(3, ge=1, le=100),
     per_day: int = Query(3, ge=1, le=10),
     window_h: int = Query(2, ge=1, le=6),
     include_low_samples: bool = Query(False),
-    fallback_to_hourly: bool = Query(True),  
     db: Session = Depends(get_db),
 ):
-    svc = PlaceProfileService(db)
-    return svc.recommend_quiet_times(
-        place_id=place_id,
-        days=days,
-        min_samples=min_samples,
-        per_day=per_day,
-        window_h=window_h,
-        include_low_samples=include_low_samples,
-        fallback_to_hourly=fallback_to_hourly, 
-    )
+    try:
+        svc = PlaceProfileService(db)
+        return svc.recommend_quiet_times(
+            place_id=place_id,
+            days=days,
+            min_samples=min_samples,
+            per_day=per_day,
+            window_h=window_h,
+            include_low_samples=include_low_samples,
+        )
+    except Exception as e:
+        # 개발 중: 어떤 에러인지 바로 보이게
+        raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}")
