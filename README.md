@@ -78,7 +78,7 @@ cd ~/boom.b/offpeak-api
 conda activate offpeak-py311
 set -a; source .env; set +a
 
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8001
 ```
 
 ## 5) API Docs / Health
