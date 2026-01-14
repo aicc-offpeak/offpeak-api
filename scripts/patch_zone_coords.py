@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """Patch a zone's coordinates inside zones_seed.json using Kakao keyword search.
 
 Usage:

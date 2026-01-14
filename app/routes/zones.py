@@ -1,4 +1,3 @@
-# app/routes/zones.py
 from __future__ import annotations
 
 import math
@@ -59,8 +58,7 @@ def nearby_zones(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    내 위치 기준 가까운 Zone을 DB(zones)에서 찾고,
-    혼잡도는 crowding_snapshots 최신 스냅샷을 재사용하거나 갱신한다.
+    지도 첫 화면/현재 위치 주변 “혼잡 구역(Zone)” 리스트 뿌릴 때
     """
     min_interval_s = int(os.getenv("CROWDING_SNAPSHOT_MIN_INTERVAL_S", "600"))  # 10분 기본
     crowding = CrowdingService()
@@ -142,9 +140,7 @@ def zone_insight(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    crowding_snapshots(시계열)을 기반으로
-    - 시간대별 평균 rank(여유=4 ... 붐빔=1)를 계산하고
-    - 덜 붐비는 시간대 TOP N을 반환
+    특정 Zone 상세 화면(“홍대 관광특구”) 들어갔을 때
     """
     zone = db.get(Zone, code)
     if not zone:
@@ -228,7 +224,7 @@ def crowding_history(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    특정 zone의 혼잡도 스냅샷 히스토리(JSON 직렬화 안전)
+    Zone 혼잡도 “최근 추이(그래프/리스트)” 보여줄 때
     """
     since = datetime.now(tz=KST) - timedelta(hours=int(hours))
 
@@ -278,4 +274,7 @@ def crowding_insight(
     days: int = Query(14, ge=1, le=60),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
+    """
+    Zone 히스토리를 요약/분석(예: 가장 한산한 시간대, 최근 대비 변화) 같은 인사이트 만들 때
+    """
     return build_insight_payload(db, zone_code=code, days=int(days))

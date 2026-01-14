@@ -1,4 +1,3 @@
-# app/services/recommender.py
 from __future__ import annotations
 
 import json
@@ -67,10 +66,8 @@ class OffpeakRecommender:
         if cached:
             return cached
 
-        # SeoulCityDataClient는 동기 클라이언트이므로 그대로 호출 (I/O 블로킹 허용)
         sc = self.seoul.fetch_area_crowding(area_name=zone.name)
 
-        # Use a lightweight timestamp (epoch seconds) without extra deps
         import time
         zc = ZoneCrowding(level=str(sc.level), updated_at_epoch=int(time.time()), raw=sc.raw)
         self._crowding_cache[zone.code] = zc
@@ -90,7 +87,6 @@ class OffpeakRecommender:
             if d <= radius_m:
                 scored.append((z, d))
 
-        # if none in radius, fallback to closest
         if not scored:
             scored = [(z, haversine_m(user_lat, user_lng, z.lat, z.lng)) for z in self.zones]
 
@@ -124,7 +120,6 @@ class OffpeakRecommender:
         for z, z_dist in candidates:
             zc = await self.get_zone_crowding(z)
             rank = CROWDING_RANK.get(zc.level, 0)
-            # score: prefer low crowding(=high rank) and nearer distance
             score = (rank * 100000) - z_dist
             zone_rows.append(
                 {
@@ -187,7 +182,6 @@ class OffpeakRecommender:
                     },
                 }
 
-                # dedupe: keep best (less crowded zone, then nearer)
                 prev = merged.get(pid)
                 if not prev:
                     merged[pid] = item
@@ -219,7 +213,6 @@ def load_zones_from_seed(path: str) -> List[Zone]:
     ]
     """
     if not os.path.exists(path):
-        # fallback minimal seed to avoid crash
         return [
             Zone(code="Z001", name="광화문·덕수궁", lat=37.571, lng=126.976),
             Zone(code="Z002", name="홍대입구역", lat=37.557, lng=126.925),

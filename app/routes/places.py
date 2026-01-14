@@ -9,8 +9,8 @@ from urllib.parse import quote
 
 import httpx
 from cachetools import TTLCache
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import desc, select, text
 from sqlalchemy.orm import Session
 
@@ -66,9 +66,19 @@ class PlaceWithZone(BaseModel):
 class PlacesSearchResponse(BaseModel):
     items: List[PlaceItem] = Field(default_factory=list)
 
+class PlaceRef(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    name: str
+    lat: float
+    lng: float
+    category_group_code: str = ""
+    place_url: str = ""
+
 
 class PlacesInsightRequest(BaseModel):
-    selected: PlaceItem
+    selected: PlaceRef
     user_lat: Optional[float] = None
     user_lng: Optional[float] = None
 
@@ -80,10 +90,54 @@ class PlacesInsightRequest(BaseModel):
     category: Optional[str] = None
     include_image: bool = True
 
+    model_config = ConfigDict(
+        extra="ignore",
+        json_schema_extra={
+            "examples": [
+                {
+                    "selected": {
+                        "id": "22105109",
+                        "name": "스타벅스 홍대역점",
+                        "lat": 37.5572887166274,
+                        "lng": 126.923637798148,
+                        "category_group_code": "CE7",
+                        "place_url": "http://place.map.kakao.com/22105109",
+                    },
+                    "recommend_from": "selected",
+                    "radius_m": 1200,
+                    "max_candidates": 10,
+                    "max_alternatives": 3,
+                    "include_image": False,
+                }
+            ]
+        },
+    )
+
 
 class PlacesInsightResponse(BaseModel):
     selected: PlaceWithZone
     alternatives: List[PlaceWithZone] = Field(default_factory=list)
+
+
+def _ref_to_place_item(ref: PlaceRef) -> PlaceItem:
+    """
+    PlaceRef(요청 최소 모델) -> PlaceItem(내부/응답 모델) 변환
+    """
+    return PlaceItem(
+        id=str(ref.id),
+        name=str(ref.name),
+        category_name="",
+        category_group_code=str(ref.category_group_code or ""),
+        category_group_name="",
+        phone="",
+        address_name="",
+        road_address_name="",
+        place_url=str(ref.place_url or ""),
+        image_url="",
+        lat=float(ref.lat),
+        lng=float(ref.lng),
+        distance_m=0.0,
+    )
 
 
 # -------------------------
@@ -438,6 +492,9 @@ def search_places(
     response: Response = None,
     db: Session = Depends(get_db),
 ) -> PlacesSearchResponse:
+    """
+    사용자가 검색창에 “스타벅스” 입력했을 때 목록 보여줄 때
+    """
     q = (query or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="query is required")
@@ -445,7 +502,6 @@ def search_places(
     size = int(max(1, min(size, 45)))
     cache = PlaceCacheService(db)
 
-    # DEBUG headers (ASCII only)
     if response is not None:
         try:
             db_name = db.execute(text("select current_database()")).scalar()
@@ -458,7 +514,6 @@ def search_places(
         except Exception:
             pass
 
-    # category filter
     if category_group_code:
         allowed = {(category_group_code or "").strip().upper()}
     elif category_scope == "cafe":
@@ -574,10 +629,34 @@ def search_places(
 
 @router.post("/insight", response_model=PlacesInsightResponse)
 def insight(
-    req: PlacesInsightRequest,
+    req: PlacesInsightRequest = Body(
+        ...,
+        examples={
+            "minimal": {
+                "summary": "최소 입력 예시",
+                "value": {
+                    "selected": {
+                        "id": "22105109",
+                        "name": "스타벅스 홍대역점",
+                        "lat": 37.5572887166274,
+                        "lng": 126.923637798148,
+                    },
+                    "include_image": False,
+                    "max_candidates": 10,
+                    "max_alternatives": 3,
+                    "radius_m": 1200,
+                    "recommend_from": "selected",
+                },
+            }
+        },
+    ),
     response: Response = None,
     db: Session = Depends(get_db),
 ) -> PlacesInsightResponse:
+    """
+    사용자가 검색창 입력 후 그 중 하나를 선택했을 때
+    장소의 nearest zone 혼잡도 + 주변 대안 장소(덜 붐비는 쪽 우선) 추천할 때
+    """
     if req.recommend_from not in {"selected", "user"}:
         raise HTTPException(status_code=400, detail="recommend_from must be 'selected' or 'user'")
 
@@ -636,7 +715,7 @@ def insight(
         ).scalar()
 
     def _raw_insert(**params: Any) -> bool:
-        # NOTE: 컬럼명이 migration과 다르면 여기서 오류가 나고 header로 드러남
+        # NOTE
         db.execute(
             text(
                 """
@@ -691,7 +770,7 @@ def insight(
                     raw=raw,
                 )
                 if did_add:
-                    db.flush()  # 여기서 스키마/테이블 문제면 바로 터짐
+                    db.flush() 
             return bool(did_add)
         except Exception as e:
             place_snap_err = e.__class__.__name__
@@ -732,18 +811,21 @@ def insight(
     wrote_any = False
     cache_dirty = False
 
+    # PlaceRef -> PlaceItem 변환 (이미지 enrichment/응답 포맷 통일)
+    selected_item = _ref_to_place_item(req.selected)
+
     selected_zone, wrote = _zone_info_for_point(
         db=db,
         zones=zones,
-        lat=req.selected.lat,
-        lng=req.selected.lng,
+        lat=selected_item.lat,
+        lng=selected_item.lng,
         crowding=crowding,
         min_interval_s=min_interval_s,
         snapshot_cache=snapshot_cache,
     )
     wrote_any = wrote_any or wrote
 
-    selected_place = _maybe_enrich_image(req.selected, req.include_image)
+    selected_place = _maybe_enrich_image(selected_item, req.include_image)
     selected = PlaceWithZone(place=selected_place, zone=selected_zone)
 
     # -------------------------
@@ -751,11 +833,11 @@ def insight(
     # -------------------------
     try:
         did = _record_place_snapshot(
-            place_id=req.selected.id,
-            place_name=req.selected.name,
-            category_group_code=req.selected.category_group_code,
-            lat=float(req.selected.lat),
-            lng=float(req.selected.lng),
+            place_id=selected_item.id,
+            place_name=selected_item.name,
+            category_group_code=selected_item.category_group_code,
+            lat=float(selected_item.lat),
+            lng=float(selected_item.lng),
             zone_code=selected_zone.code,
             zone_distance_m=float(selected_zone.distance_m),
             level=selected_zone.crowding_level,
@@ -829,7 +911,7 @@ def insight(
     candidates: List[PlaceWithZone] = []
     for d in docs:
         p = _doc_to_place(d)
-        if not p.id or p.id == req.selected.id:
+        if not p.id or p.id == selected_item.id:
             continue
 
         p = _maybe_enrich_image(p, req.include_image)
@@ -902,6 +984,7 @@ def insight(
 
     return PlacesInsightResponse(selected=selected, alternatives=alternatives)
 
+
 @router.get("/profile")
 def place_profile(
     place_id: str = Query(..., description="Kakao place id"),
@@ -909,8 +992,12 @@ def place_profile(
     min_samples: int = Query(3, ge=1, le=100, description="셀당 최소 샘플 수"),
     db: Session = Depends(get_db),
 ):
+    """
+    이 장소는 요일×시간대별로 언제 덜 붐비는지 보여줄 때 (표/히트맵)
+    """
     svc = PlaceProfileService(db)
     return svc.weekly_hourly_profile(place_id=place_id, days=days, min_samples=min_samples)
+
 
 @router.get("/recommend_times")
 def recommend_times(
@@ -922,6 +1009,9 @@ def recommend_times(
     include_low_samples: bool = Query(False),
     db: Session = Depends(get_db),
 ):
+    """
+    사용자에게 “요일별 덜 붐비는 시간대 추천” 문장/카드로 보여줄 때
+    """
     try:
         svc = PlaceProfileService(db)
         return svc.recommend_quiet_times(

@@ -1,4 +1,3 @@
-# app/services/crowding.py
 from __future__ import annotations
 
 import os
@@ -17,7 +16,7 @@ class CrowdingSnapshot:
     color: str
     message: str
     updated_at_epoch: int
-    raw: dict[str, Any]  # SeoulCityDataClient record
+    raw: dict[str, Any] 
 
 
 def crowding_rank(level: str) -> int:

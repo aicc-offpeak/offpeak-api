@@ -164,8 +164,7 @@ def recommend(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    내 위치 기준 덜 붐비는 Zone을 우선 골라 그 주변 카페/음식점을 추천 (DB 기반)
-    + place_cache(DB) 우선 재사용, 부족하면 카카오 호출 후 upsert
+    “지금 덜 붐비는 곳 추천” 같은 원샷 추천 API
     """
     try:
         group_code = KAKAO_GROUP_CODE[category]
@@ -201,7 +200,7 @@ def recommend(
         return {"items": []}
 
     cand.sort(key=lambda x: x[1])
-    cand = cand[: max(10, top_zones * 3)]  # 가까운 후보 풀 조금 넉넉히
+    cand = cand[: max(10, top_zones * 3)]  
 
     # 2) zone별 crowding 스냅샷 확보 + 덜 붐비는 순 정렬
     zone_rows: List[Dict[str, Any]] = []
