@@ -361,7 +361,6 @@ class PlaceProfileService:
                 conf = self._confidence_bucket(int(w.get("n") or 0), min_samples=min_samples)
                 w["confidence"] = conf
 
-                # 숫자(baseline/delta)는 응답에 넣지 않음
                 w["reason"] = self._make_reason(
                     dow=d,
                     time_label=str(w["label"]),

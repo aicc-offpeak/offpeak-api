@@ -128,7 +128,7 @@ class PlaceCacheService:
             "address_name": row.address_name,
             "road_address_name": row.road_address_name,
             "place_url": row.place_url,
-            "image_url": "",  # 호환 필드
+            "image_url": "", 
             "lat": float(row.lat or 0.0),
             "lng": float(row.lng or 0.0),
             "distance_m": float(round(distance_m, 1)),
@@ -158,7 +158,6 @@ class PlaceCacheService:
         limit = int(max(1, min(limit, 50)))
         radius_m = int(max(0, min(radius_m, 20000)))
 
-        # bbox(대략)
         lat_delta = radius_m / 111320.0
         cosv = math.cos(math.radians(lat)) or 1e-9
         lng_delta = radius_m / (111320.0 * cosv)
@@ -169,7 +168,6 @@ class PlaceCacheService:
         if allowed_category_group_codes:
             allowed_norm = {_norm_cgc(x) for x in allowed_category_group_codes if _norm_cgc(x)}
 
-        # 디버그 카운트는 "fresh 기준"으로 맞춤 (진단 정확도 ↑)
         total_count = self.db.scalar(select(func.count()).select_from(PlaceCacheModel))
         fresh_count = self.db.scalar(
             select(func.count()).select_from(PlaceCacheModel).where(PlaceCacheModel.last_fetched_at >= fresh_since)
@@ -204,8 +202,6 @@ class PlaceCacheService:
             .where(PlaceCacheModel.lng.between(lng - lng_delta, lng + lng_delta))
         )
 
-        # FIX: allowed가 있을 때도 DB에서 1차 필터
-        # (단, category_group_code가 비어있으면 통과시켜서 "Kakao가 code 안 준 row"도 살림)
         if allowed_norm:
             stmt = stmt.where(
                 or_(
@@ -229,7 +225,6 @@ class PlaceCacheService:
 
         out: List[Tuple[PlaceCacheModel, float]] = []
         for r in rows:
-            # FIX: Python 레벨에서도 정규화 비교 + 비어있으면 통과
             if allowed_norm:
                 rcgc = _norm_cgc(r.category_group_code)
                 if rcgc and (rcgc not in allowed_norm):
