@@ -478,7 +478,6 @@ def _zone_info_for_point(
 SearchScope = Literal["cache", "api", "all"]
 CategoryScope = Literal["cafe", "food", "food_cafe", "all"]
 
-
 @router.get("/search", response_model=PlacesSearchResponse)
 def search_places(
     query: str = Query(..., min_length=1, description="검색어(예: 스타벅스)"),
@@ -494,14 +493,18 @@ def search_places(
 ) -> PlacesSearchResponse:
     """
     사용자가 검색창에 “스타벅스” 입력했을 때 목록 보여줄 때
+    - 단일 글자(예: "스") 같은 짧은 검색은 keyword 검색이 너무 넓게 걸리므로,
+      카테고리 검색(CE7/FD6) 2번 + place_name prefix 필터로 제한
     """
     q = (query or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="query is required")
 
     size = int(max(1, min(size, 45)))
+    radius_m = int(max(0, min(int(radius_m), 20000)))
     cache = PlaceCacheService(db)
 
+    # DEBUG headers (ASCII only)
     if response is not None:
         try:
             db_name = db.execute(text("select current_database()")).scalar()
@@ -514,6 +517,7 @@ def search_places(
         except Exception:
             pass
 
+    # category filter (요청 파라미터 기반)
     if category_group_code:
         allowed = {(category_group_code or "").strip().upper()}
     elif category_scope == "cafe":
@@ -525,13 +529,26 @@ def search_places(
     else:
         allowed = None
 
+    # -------------------------
+    # Short query rule
+    # -------------------------
+    SHORT_LEN = 1  # "스" 같은 1글자 입력 케이스
+    is_short = len(q) <= SHORT_LEN
+
+    def _name_startswith(doc: Dict[str, Any], prefix: str) -> bool:
+        name = _safe_str(doc.get("place_name") or doc.get("name")).strip()
+        return bool(name) and name.startswith(prefix)
+
+    # -------------------------
+    # 1) cache search
+    # -------------------------
     cached_items: List[PlaceItem] = []
     if scope in ("cache", "all"):
         rows = cache.search_nearby_in_db(
             query=q,
             lat=lat,
             lng=lng,
-            radius_m=int(radius_m),
+            radius_m=radius_m,
             limit=size,
             allowed_category_group_codes=allowed,
         )
@@ -569,36 +586,92 @@ def search_places(
             response.headers["X-Place-Cache"] = f"source=cache hits={cache_hits} writes=0"
         return PlacesSearchResponse(items=cached_items[:size])
 
+    # -------------------------
+    # 2) api search (keyword OR categoryx2 for short query)
+    # -------------------------
     need = size if scope == "api" else (size - cache_hits)
-    try:
-        docs = kakao_keyword_search(query=q, lat=lat, lng=lng, radius_m=radius_m, max_results=need)
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"places search failed: {e}")
+    need = int(max(1, min(need, 45)))
+
+    docs: List[Dict[str, Any]] = []
+    api_mode = "keyword"
+
+    # short query면 "카테고리 검색 2번"으로 전환
+    if is_short:
+        api_mode = "category_short"
+
+        # allowed가 None(all)이어도 short query는 CE7/FD6로 강제 제한
+        if allowed is None:
+            cgcs = ["CE7", "FD6"]
+        else:
+            cgcs = sorted(list(allowed))
+
+        fetch_each = min(45, max(15, need * 2))
+
+        all_docs: List[Dict[str, Any]] = []
+        for cgc in cgcs:
+            try:
+                part = kakao_category_search(
+                    category_group_code=cgc,
+                    lat=lat,
+                    lng=lng,
+                    radius_m=radius_m,
+                    max_results=fetch_each,
+                )
+                all_docs.extend(part)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"places category search failed: {e}")
+
+        # "스" -> place_name이 "스"로 시작하는 것만
+        all_docs = [d for d in all_docs if _name_startswith(d, q)]
+
+        # 혹시라도 섞이면 다시 한 번 strict filter
+        if allowed is None:
+            allowed2 = {"CE7", "FD6"}
+        else:
+            allowed2 = allowed
+        all_docs = [d for d in all_docs if _doc_cgc(d) in allowed2]
+
+        # id 중복 제거 + distance 기준 정렬(카테고리별 호출 merge라서 재정렬 필요)
+        seen: set[str] = set()
+        uniq: List[Dict[str, Any]] = []
+        for d in all_docs:
+            pid = _safe_str(d.get("id")).strip()
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            uniq.append(d)
+
+        uniq.sort(key=lambda d: _safe_float(d.get("distance") or d.get("distance_m"), 1e18))
+        docs = uniq[:need]
+
+    else:
+        # 기존: keyword search
+        try:
+            docs = kakao_keyword_search(query=q, lat=lat, lng=lng, radius_m=radius_m, max_results=need)
+        except RuntimeError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"places search failed: {e}")
+
+        if allowed is not None:
+            docs = [d for d in docs if (_doc_cgc(d) in allowed) or (_doc_cgc(d) == "")]
 
     if response is not None:
         try:
+            response.headers["X-Api-Mode"] = api_mode
             response.headers["X-Kakao-Docs-Raw"] = str(len(docs))
         except Exception:
             pass
 
-    if allowed is not None:
-        docs = [d for d in docs if (_doc_cgc(d) in allowed) or (_doc_cgc(d) == "")]
-
-    if response is not None:
-        try:
-            response.headers["X-Kakao-Docs-AfterFilter"] = str(len(docs))
-            response.headers["X-Kakao-Allowed"] = ",".join(sorted(allowed)) if allowed else ""
-        except Exception:
-            pass
-
+    # -------------------------
+    # 3) upsert cache + merge
+    # -------------------------
     wrote = 0
     seen_ids = {it.id for it in cached_items}
     api_items: List[PlaceItem] = []
 
     for d in docs:
-        pid = _safe_str(d.get("id"))
+        pid = _safe_str(d.get("id")).strip()
         if not pid or pid in seen_ids:
             continue
         seen_ids.add(pid)
