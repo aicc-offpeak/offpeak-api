@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 import time
 from dataclasses import dataclass
@@ -66,11 +67,48 @@ def _cursor_write(path: Path, v: int) -> None:
         pass
 
 
-def _pick_zone_batch(db: Session, *, zones_per_run: int, cursor_file: Path) -> Tuple[List[Zone], Dict[str, Any]]:
+def _load_or_create_shuffle_seed(seed_file: Path) -> int:
+    """
+    shuffle_zones=True일 때, 매번 동일한 '셔플 순서'를 유지하기 위한 seed를 파일에 저장/재사용.
+    """
+    try:
+        if seed_file.exists():
+            s = seed_file.read_text(encoding="utf-8").strip()
+            return int(s)
+    except Exception:
+        pass
+
+    # 새 seed 생성 (재현 가능한 안정성은 seed_file로 확보됨)
+    seed = random.SystemRandom().randint(1, 2_147_483_647)
+    try:
+        seed_file.write_text(str(seed), encoding="utf-8")
+    except Exception:
+        pass
+    return seed
+
+
+def _pick_zone_batch(
+    db: Session,
+    *,
+    zones_per_run: int,
+    cursor_file: Path,
+    shuffle_zones: bool,
+    shuffle_seed: Optional[int],
+    shuffle_seed_file: Path,
+) -> Tuple[List[Zone], Dict[str, Any]]:
     zones = list(db.scalars(select(Zone).order_by(Zone.code)).all())
     n_total = len(zones)
     if n_total == 0:
-        return [], {"total": 0, "start": 0, "next": 0}
+        return [], {"total": 0, "start": 0, "next": 0, "shuffled": False, "seed": None}
+
+    # (옵션) 고정 seed로 셔플한 뒤, 그 셔플된 리스트에서 라운드로빈
+    seed_used: Optional[int] = None
+    shuffled = False
+    if shuffle_zones:
+        seed_used = int(shuffle_seed) if shuffle_seed is not None else _load_or_create_shuffle_seed(shuffle_seed_file)
+        rng = random.Random(seed_used)
+        rng.shuffle(zones)
+        shuffled = True
 
     zones_per_run = max(1, min(int(zones_per_run), n_total))
 
@@ -82,7 +120,7 @@ def _pick_zone_batch(db: Session, *, zones_per_run: int, cursor_file: Path) -> T
     nxt = (start + zones_per_run) % n_total
     _cursor_write(cursor_file, nxt)
 
-    return batch, {"total": n_total, "start": start, "next": nxt}
+    return batch, {"total": n_total, "start": start, "next": nxt, "shuffled": shuffled, "seed": seed_used}
 
 
 def _is_fresh_ts(ts: Optional[datetime], min_interval_s: int) -> bool:
@@ -103,7 +141,13 @@ class ZoneSnap:
     color: str
 
 
-def _get_or_fetch_zone_snapshot(db: Session, *, z: Zone, crowding: CrowdingService, min_interval_s: int) -> Tuple[ZoneSnap, bool]:
+def _get_or_fetch_zone_snapshot(
+    db: Session,
+    *,
+    z: Zone,
+    crowding: CrowdingService,
+    min_interval_s: int,
+) -> Tuple[ZoneSnap, bool]:
     latest: CrowdingSnapshotModel | None = db.scalar(
         select(CrowdingSnapshotModel)
         .where(CrowdingSnapshotModel.zone_code == z.code)
@@ -210,6 +254,9 @@ def run_profile_once(
     sleep_ms: int,
     commit_every_zone: bool,
     cursor_path: Path,
+    shuffle_zones: bool,
+    shuffle_seed: Optional[int],
+    shuffle_seed_file: Path,
 ) -> None:
     crowding = CrowdingService()
 
@@ -222,9 +269,20 @@ def run_profile_once(
     errors = 0
 
     with SessionLocal() as db:
-        batch, meta = _pick_zone_batch(db, zones_per_run=zones_per_run, cursor_file=cursor_path)
+        batch, meta = _pick_zone_batch(
+            db,
+            zones_per_run=zones_per_run,
+            cursor_file=cursor_path,
+            shuffle_zones=shuffle_zones,
+            shuffle_seed=shuffle_seed,
+            shuffle_seed_file=shuffle_seed_file,
+        )
+
         print(f"[profile] zones_per_run={zones_per_run} tracked_per_zone={tracked_per_zone} radius_m={seed_radius_m}")
-        print(f"[cursor] total_zones={meta['total']} start={meta['start']} next={meta['next']} cursor_file={cursor_path.name}")
+        print(
+            f"[cursor] total_zones={meta['total']} start={meta['start']} next={meta['next']} "
+            f"cursor_file={cursor_path.name} shuffled={meta['shuffled']} seed={meta['seed']}"
+        )
 
         place_snap = PlaceCrowdingSnapshotService(db)
 
@@ -295,9 +353,29 @@ def main() -> None:
     parser.add_argument("--commit-every-zone", action="store_true")
     parser.add_argument("--cursor-file", type=str, default=".zone_cursor")
 
+    # 랜덤 순서(하지만 seed로 고정된 순서) + 라운드로빈
+    parser.add_argument(
+        "--shuffle-zones",
+        action="store_true",
+        help="Use a shuffled but stable zone order (round-robin on shuffled list)",
+    )
+    parser.add_argument(
+        "--shuffle-seed",
+        type=int,
+        default=None,
+        help="Seed for shuffling (optional). If not set, use seed file.",
+    )
+    parser.add_argument(
+        "--shuffle-seed-file",
+        type=str,
+        default=".zone_shuffle_seed",
+        help="File to persist shuffle seed for stable order",
+    )
+
     args = parser.parse_args()
 
     cursor_path = (ROOT / args.cursor_file).resolve()
+    shuffle_seed_file = (ROOT / args.shuffle_seed_file).resolve()
 
     run_profile_once(
         zones_per_run=int(args.zones_per_run),
@@ -306,6 +384,9 @@ def main() -> None:
         sleep_ms=int(args.sleep_ms),
         commit_every_zone=bool(args.commit_every_zone),
         cursor_path=cursor_path,
+        shuffle_zones=bool(args.shuffle_zones),
+        shuffle_seed=(int(args.shuffle_seed) if args.shuffle_seed is not None else None),
+        shuffle_seed_file=shuffle_seed_file,
     )
 
 
