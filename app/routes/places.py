@@ -25,6 +25,8 @@ from app.services.place_profile import PlaceProfileService
 KAKAO_BASE_URL = "https://dapi.kakao.com"
 router = APIRouter(prefix="/places", tags=["places"])
 
+ALLOWED_CGC = {"CE7", "FD6"}
+
 
 # -------------------------
 # Models
@@ -65,6 +67,7 @@ class PlaceWithZone(BaseModel):
 
 class PlacesSearchResponse(BaseModel):
     items: List[PlaceItem] = Field(default_factory=list)
+
 
 class PlaceRef(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -176,6 +179,10 @@ def _kakao_rest_key() -> str:
 
 def _doc_cgc(d: Dict[str, Any]) -> str:
     return (d.get("category_group_code") or "").strip().upper()
+
+
+def _norm_cgc(s: Optional[str]) -> str:
+    return (s or "").strip().upper()
 
 
 # -------------------------
@@ -476,7 +483,31 @@ def _zone_info_for_point(
 # Endpoints
 # -------------------------
 SearchScope = Literal["cache", "api", "all"]
-CategoryScope = Literal["cafe", "food", "food_cafe", "all"]
+CategoryScope = Literal["cafe", "food", "food_cafe"]
+
+
+# -------------------------
+# Helpers for category-double search
+# -------------------------
+def _norm(s: str) -> str:
+    return (s or "").strip().lower().replace(" ", "")
+
+
+def _name_match(doc: Dict[str, Any], q: str) -> bool:
+    qn = _norm(q)
+    if not qn:
+        return False
+    name = _norm(str(doc.get("place_name") or doc.get("name") or ""))
+    return qn in name
+
+
+def _only_allowed_items(items: List[PlaceItem]) -> List[PlaceItem]:
+    out: List[PlaceItem] = []
+    for it in items:
+        if _norm_cgc(it.category_group_code) in ALLOWED_CGC:
+            out.append(it)
+    return out
+
 
 @router.get("/search", response_model=PlacesSearchResponse)
 def search_places(
@@ -484,17 +515,17 @@ def search_places(
     lat: float = Query(..., ge=-90, le=90, description="현재 위도"),
     lng: float = Query(..., ge=-180, le=180, description="현재 경도"),
     size: int = Query(15, ge=1, le=45, description="가까운 순 결과 개수(기본 15, 최대 45)"),
-    radius_m: int = Query(3000, ge=0, le=20000, description="검색 반경(m) (기본 3000)"),
+    radius_m: int = Query(3000, ge=0, le=20000, description="검색 반경(m)"),
     scope: SearchScope = Query("all", description="cache | api | all"),
-    category_scope: CategoryScope = Query("food_cafe", description="cafe | food | food_cafe | all"),
+    category_scope: CategoryScope = Query("food_cafe", description="cafe | food | food_cafe"),
     category_group_code: Optional[str] = Query(None, description="카테고리 그룹 코드(CE7, FD6)"),
     response: Response = None,
     db: Session = Depends(get_db),
 ) -> PlacesSearchResponse:
     """
-    사용자가 검색창에 “스타벅스” 입력했을 때 목록 보여줄 때
-    - 단일 글자(예: "스") 같은 짧은 검색은 keyword 검색이 너무 넓게 걸리므로,
-      카테고리 검색(CE7/FD6) 2번 + place_name prefix 필터로 제한
+    검색창에서 이용자가 가고자 하는 곳 검색
+    - (기본) 2글자 이상부터 검색
+    - cache 먼저 보고 부족하면 api 호출
     """
     q = (query or "").strip()
     if not q:
@@ -504,7 +535,31 @@ def search_places(
     radius_m = int(max(0, min(int(radius_m), 20000)))
     cache = PlaceCacheService(db)
 
-    # DEBUG headers (ASCII only)
+    # -------------------------
+    # Min length guard (1글자 제한)
+    # -------------------------
+    MIN_SEARCH_LEN = 2
+    if len(q) < MIN_SEARCH_LEN:
+        if response is not None:
+            response.headers["X-Search-Guard"] = "query_too_short"
+        return PlacesSearchResponse(items=[])
+
+    # -------------------------
+    # category filter (CE7/FD6 only)
+    # -------------------------
+    if category_group_code:
+        code = _norm_cgc(category_group_code)
+        if code not in ALLOWED_CGC:
+            raise HTTPException(status_code=400, detail="category_group_code must be CE7 or FD6")
+        allowed: set[str] = {code}
+    else:
+        if category_scope == "cafe":
+            allowed = {"CE7"}
+        elif category_scope == "food":
+            allowed = {"FD6"}
+        else:
+            allowed = {"CE7", "FD6"}  
+
     if response is not None:
         try:
             db_name = db.execute(text("select current_database()")).scalar()
@@ -514,30 +569,9 @@ def search_places(
             response.headers["X-PlaceCache-TTL"] = str(cache.ttl_s)
             response.headers["X-App-File"] = __file__
             response.headers["X-Query"] = quote(q, safe="")
+            response.headers["X-Allowed-CGC"] = ",".join(sorted(list(allowed)))
         except Exception:
             pass
-
-    # category filter (요청 파라미터 기반)
-    if category_group_code:
-        allowed = {(category_group_code or "").strip().upper()}
-    elif category_scope == "cafe":
-        allowed = {"CE7"}
-    elif category_scope == "food":
-        allowed = {"FD6"}
-    elif category_scope == "food_cafe":
-        allowed = {"CE7", "FD6"}
-    else:
-        allowed = None
-
-    # -------------------------
-    # Short query rule
-    # -------------------------
-    SHORT_LEN = 1  # "스" 같은 1글자 입력 케이스
-    is_short = len(q) <= SHORT_LEN
-
-    def _name_startswith(doc: Dict[str, Any], prefix: str) -> bool:
-        name = _safe_str(doc.get("place_name") or doc.get("name")).strip()
-        return bool(name) and name.startswith(prefix)
 
     # -------------------------
     # 1) cache search
@@ -553,99 +587,68 @@ def search_places(
             allowed_category_group_codes=allowed,
         )
 
-        if response is not None:
-            try:
-                response.headers["X-Cache-DBRows"] = str(len(rows))
-                if cache._last_debug_info:
-                    debug = cache._last_debug_info
-                    response.headers["X-Cache-Debug"] = (
-                        f"total={debug.get('total_count', 0)} "
-                        f"fresh={debug.get('fresh_count', 0)} "
-                        f"name_match={debug.get('name_match_count', 0)} "
-                        f"bbox={debug.get('bbox_count', 0)} "
-                        f"combined={debug.get('combined_count', 0)}"
-                    )
-            except Exception as e:
-                try:
-                    response.headers["X-Cache-Debug-Error"] = e.__class__.__name__
-                except Exception:
-                    pass
-
         for r, d in rows:
-            cached_items.append(PlaceItem(**cache.row_to_place_dict(r, distance_m=d)))
+            item = PlaceItem(**cache.row_to_place_dict(r, distance_m=d))
+            if _norm_cgc(item.category_group_code) not in allowed:
+                continue
+            cached_items.append(item)
 
     cache_hits = len(cached_items)
 
     if scope == "cache":
         if response is not None:
             response.headers["X-Place-Cache"] = f"source=cache hits={cache_hits} writes=0"
-        return PlacesSearchResponse(items=cached_items[:size])
+        return PlacesSearchResponse(items=_only_allowed_items(cached_items[:size]))
 
     if scope == "all" and cache_hits >= size:
         if response is not None:
             response.headers["X-Place-Cache"] = f"source=cache hits={cache_hits} writes=0"
-        return PlacesSearchResponse(items=cached_items[:size])
+        return PlacesSearchResponse(items=_only_allowed_items(cached_items[:size]))
 
     # -------------------------
-    # 2) api search (keyword OR categoryx2 for short query)
+    # 2) api fetch
     # -------------------------
     need = size if scope == "api" else (size - cache_hits)
     need = int(max(1, min(need, 45)))
 
     docs: List[Dict[str, Any]] = []
-    api_mode = "keyword"
 
-    # short query면 "카테고리 검색 2번"으로 전환
-    if is_short:
-        api_mode = "category_short"
-
-        # allowed가 None(all)이어도 short query는 CE7/FD6로 강제 제한
-        if allowed is None:
-            cgcs = ["CE7", "FD6"]
-        else:
-            cgcs = sorted(list(allowed))
-
-        fetch_each = min(45, max(15, need * 2))
-
-        all_docs: List[Dict[str, Any]] = []
-        for cgc in cgcs:
-            try:
-                part = kakao_category_search(
-                    category_group_code=cgc,
+    try:
+        tmp: List[Dict[str, Any]] = []
+        for code in sorted(list(allowed)): 
+            tmp.extend(
+                kakao_category_search(
+                    category_group_code=code,
                     lat=lat,
                     lng=lng,
                     radius_m=radius_m,
-                    max_results=fetch_each,
+                    max_results=45,
                 )
-                all_docs.extend(part)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"places category search failed: {e}")
+            )
+        tmp = [d for d in tmp if _name_match(d, q)]
 
-        # "스" -> place_name이 "스"로 시작하는 것만
-        all_docs = [d for d in all_docs if _name_startswith(d, q)]
-
-        # 혹시라도 섞이면 다시 한 번 strict filter
-        if allowed is None:
-            allowed2 = {"CE7", "FD6"}
-        else:
-            allowed2 = allowed
-        all_docs = [d for d in all_docs if _doc_cgc(d) in allowed2]
-
-        # id 중복 제거 + distance 기준 정렬(카테고리별 호출 merge라서 재정렬 필요)
-        seen: set[str] = set()
-        uniq: List[Dict[str, Any]] = []
-        for d in all_docs:
-            pid = _safe_str(d.get("id")).strip()
+        seen = set()
+        for d in tmp:
+            pid = str(d.get("id") or "").strip()
             if not pid or pid in seen:
                 continue
             seen.add(pid)
-            uniq.append(d)
+            docs.append(d)
 
-        uniq.sort(key=lambda d: _safe_float(d.get("distance") or d.get("distance_m"), 1e18))
-        docs = uniq[:need]
+        def _dist(doc: Dict[str, Any]) -> float:
+            return _safe_float(doc.get("distance") or doc.get("distance_m"), 1e18)
 
-    else:
-        # 기존: keyword search
+        docs.sort(key=_dist)
+        docs = docs[:need]
+
+        if response is not None:
+            response.headers["X-Api-Mode"] = "category-double"
+    except Exception as e:
+        if response is not None:
+            response.headers["X-Api-Mode"] = f"category-double-failed:{e.__class__.__name__}"
+        docs = []
+
+    if not docs:
         try:
             docs = kakao_keyword_search(query=q, lat=lat, lng=lng, radius_m=radius_m, max_results=need)
         except RuntimeError as e:
@@ -653,15 +656,11 @@ def search_places(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"places search failed: {e}")
 
-        if allowed is not None:
-            docs = [d for d in docs if (_doc_cgc(d) in allowed) or (_doc_cgc(d) == "")]
+        docs = [d for d in docs if _doc_cgc(d) in allowed]
 
-    if response is not None:
-        try:
-            response.headers["X-Api-Mode"] = api_mode
+        if response is not None:
+            response.headers["X-Api-Mode"] = "keyword"
             response.headers["X-Kakao-Docs-Raw"] = str(len(docs))
-        except Exception:
-            pass
 
     # -------------------------
     # 3) upsert cache + merge
@@ -674,6 +673,10 @@ def search_places(
         pid = _safe_str(d.get("id")).strip()
         if not pid or pid in seen_ids:
             continue
+
+        if _doc_cgc(d) not in allowed:
+            continue
+
         seen_ids.add(pid)
 
         try:
@@ -692,12 +695,12 @@ def search_places(
     if scope == "api":
         if response is not None:
             response.headers["X-Place-Cache"] = f"source=api hits=0 writes={wrote}"
-        return PlacesSearchResponse(items=api_items[:size])
+        return PlacesSearchResponse(items=_only_allowed_items(api_items[:size]))
 
     merged = (cached_items + api_items)[:size]
     if response is not None:
         response.headers["X-Place-Cache"] = f"source=merged hits={cache_hits} writes={wrote}"
-    return PlacesSearchResponse(items=merged)
+    return PlacesSearchResponse(items=_only_allowed_items(merged))
 
 
 @router.post("/insight", response_model=PlacesInsightResponse)
@@ -749,6 +752,8 @@ def insight(
     if not cgc:
         cgc = "CE7"
 
+    radius_m = int(max(0, min(int(req.radius_m), 2000)))
+
     zones: List[Zone] = list(db.scalars(select(Zone)).all())
     min_interval_s = int(os.getenv("CROWDING_SNAPSHOT_MIN_INTERVAL_S", "600"))
     crowding = CrowdingService()
@@ -788,7 +793,6 @@ def insight(
         ).scalar()
 
     def _raw_insert(**params: Any) -> bool:
-        # NOTE
         db.execute(
             text(
                 """
@@ -843,12 +847,12 @@ def insight(
                     raw=raw,
                 )
                 if did_add:
-                    db.flush() 
+                    db.flush()
             return bool(did_add)
         except Exception as e:
             place_snap_err = e.__class__.__name__
 
-        # 2) fallback raw SQL (테이블/컬럼이 실제로 존재하면 insert라도 되게)
+        # 2) fallback raw SQL
         try:
             latest = _raw_latest_ts(pid)
             min_s = int(os.getenv("PLACE_CROWDING_SNAPSHOT_MIN_INTERVAL_S", "1800"))
@@ -873,7 +877,6 @@ def insight(
                 db.flush()
             return True
         except Exception as e2:
-            # 두 단계 모두 실패하면 "A->B" 형태로 남김 (헤더 ASCII OK)
             place_snap_err = f"{place_snap_err}->{e2.__class__.__name__}" if place_snap_err else e2.__class__.__name__
             return False
 
@@ -884,7 +887,6 @@ def insight(
     wrote_any = False
     cache_dirty = False
 
-    # PlaceRef -> PlaceItem 변환 (이미지 enrichment/응답 포맷 통일)
     selected_item = _ref_to_place_item(req.selected)
 
     selected_zone, wrote = _zone_info_for_point(
@@ -934,7 +936,7 @@ def insight(
     cached = place_cache.get_cached_places_near(
         lat=center_lat,
         lng=center_lng,
-        radius_m=int(req.radius_m),
+        radius_m=radius_m, 
         category_group_code=cgc,
         limit=int(req.max_candidates),
         ttl_s=ttl_s,
@@ -965,7 +967,7 @@ def insight(
                 category_group_code=cgc,
                 lat=center_lat,
                 lng=center_lng,
-                radius_m=int(req.radius_m),
+                radius_m=radius_m,  
                 max_results=int(req.max_candidates),
             )
         except Exception as e:
@@ -1048,15 +1050,17 @@ def insight(
         except Exception:
             pass
 
+    OK_LEVELS = {"여유", "보통"}
+    ok_candidates = [x for x in candidates if (x.zone.crowding_level or "").strip() in OK_LEVELS]
+
     sel_rank = selected_zone.crowding_rank
-    better = [x for x in candidates if x.zone.crowding_rank > sel_rank]
-    pool = better if better else candidates
+    better = [x for x in ok_candidates if x.zone.crowding_rank > sel_rank]
+    pool = better if better else ok_candidates
 
     pool.sort(key=lambda x: (-x.zone.crowding_rank, x.place.distance_m))
     alternatives = pool[: int(max(0, req.max_alternatives))]
 
     return PlacesInsightResponse(selected=selected, alternatives=alternatives)
-
 
 @router.get("/profile")
 def place_profile(
@@ -1096,5 +1100,4 @@ def recommend_times(
             include_low_samples=include_low_samples,
         )
     except Exception as e:
-        # 개발 중: 어떤 에러인지 바로 보이게
         raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}")

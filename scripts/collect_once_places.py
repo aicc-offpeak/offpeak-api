@@ -14,23 +14,18 @@ from dotenv import load_dotenv
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
-# ---------------------------------
-# Path + .env (MUST be before app imports)
-# ---------------------------------
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 load_dotenv(dotenv_path=ROOT / ".env", override=True)
 
-# ---------------------------------
-# App imports
-# ---------------------------------
-from app.db import SessionLocal  # noqa: E402
-from app.models import CrowdingSnapshot as CrowdingSnapshotModel  # noqa: E402
-from app.models import PlaceCache as PlaceCacheModel  # noqa: E402
-from app.models import Zone  # noqa: E402
-from app.services.crowding import CrowdingService, crowding_color  # noqa: E402
-from app.services.place_crowding_snapshot import PlaceCrowdingSnapshotService  # noqa: E402
+from app.db import SessionLocal  
+from app.models import CrowdingSnapshot as CrowdingSnapshotModel  
+from app.models import PlaceCache as PlaceCacheModel  
+from app.models import Zone  
+from app.services.crowding import CrowdingService, crowding_color  
+from app.services.place_crowding_snapshot import PlaceCrowdingSnapshotService  
 
+ALLOWED_CGC = {"CE7", "FD6"}
 
 # -------------------------
 # Utils
@@ -78,7 +73,6 @@ def _load_or_create_shuffle_seed(seed_file: Path) -> int:
     except Exception:
         pass
 
-    # 새 seed 생성 (재현 가능한 안정성은 seed_file로 확보됨)
     seed = random.SystemRandom().randint(1, 2_147_483_647)
     try:
         seed_file.write_text(str(seed), encoding="utf-8")
@@ -101,7 +95,6 @@ def _pick_zone_batch(
     if n_total == 0:
         return [], {"total": 0, "start": 0, "next": 0, "shuffled": False, "seed": None}
 
-    # (옵션) 고정 seed로 셔플한 뒤, 그 셔플된 리스트에서 라운드로빈
     seed_used: Optional[int] = None
     shuffled = False
     if shuffle_zones:
@@ -214,20 +207,19 @@ def _tracked_places_for_zone(
     if lat0 == 0.0 and lng0 == 0.0:
         return []
 
-    # bbox(대략)
     lat_delta = radius_m / 111320.0
     import math
 
     cosv = math.cos(math.radians(lat0)) or 1e-9
     lng_delta = radius_m / (111320.0 * cosv)
 
-    # SQL 상에서 대충 가까운 후보(prelimit)만 먼저 뽑기
     dist2 = func.pow(PlaceCacheModel.lat - lat0, 2) + func.pow(PlaceCacheModel.lng - lng0, 2)
 
     stmt = (
         select(PlaceCacheModel)
         .where(PlaceCacheModel.lat.between(lat0 - lat_delta, lat0 + lat_delta))
         .where(PlaceCacheModel.lng.between(lng0 - lng_delta, lng0 + lng_delta))
+        .where(PlaceCacheModel.category_group_code.in_(sorted(ALLOWED_CGC)))
         .order_by(dist2.asc())
         .limit(prelimit)
     )
@@ -260,7 +252,6 @@ def run_profile_once(
 ) -> None:
     crowding = CrowdingService()
 
-    # zone snapshot은 너무 자주 안 찍어도 되게(기본 10분)
     zone_min_interval_s = int(os.getenv("CROWDING_SNAPSHOT_MIN_INTERVAL_S", "600"))
 
     wrote_zone = 0
