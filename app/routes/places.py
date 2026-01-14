@@ -26,7 +26,7 @@ KAKAO_BASE_URL = "https://dapi.kakao.com"
 router = APIRouter(prefix="/places", tags=["places"])
 
 ALLOWED_CGC = {"CE7", "FD6"}
-
+_anchor_cache = TTLCache(maxsize=2048, ttl=int(os.getenv("PLACE_ANCHOR_CACHE_TTL_S", "3600") or "3600"))
 
 # -------------------------
 # Models
@@ -123,9 +123,6 @@ class PlacesInsightResponse(BaseModel):
 
 
 def _ref_to_place_item(ref: PlaceRef) -> PlaceItem:
-    """
-    PlaceRef(요청 최소 모델) -> PlaceItem(내부/응답 모델) 변환
-    """
     return PlaceItem(
         id=str(ref.id),
         name=str(ref.name),
@@ -240,6 +237,67 @@ def kakao_keyword_search(
             if not pid or pid in seen:
                 continue
             seen.add(pid)
+            docs_all.append(d)
+            if len(docs_all) >= max_results:
+                break
+
+        if is_end:
+            break
+        page += 1
+
+    return docs_all
+
+
+def kakao_keyword_search_accuracy(
+    *,
+    query: str,
+    max_results: int,
+) -> List[Dict[str, Any]]:
+    """
+    좌표 없이 keyword 검색(정확도 기반)으로 '지역/목적지' 좌표를 얻기 위한 헬퍼
+    - sort=accuracy
+    """
+    url = f"{KAKAO_BASE_URL}/v2/local/search/keyword.json"
+    headers = {"Authorization": f"KakaoAK {_kakao_rest_key()}"}
+
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    max_results = int(max(1, min(max_results, 45)))
+
+    docs_all: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    page = 1
+
+    while len(docs_all) < max_results and page <= 45:
+        remaining = max_results - len(docs_all)
+        size = min(15, remaining)
+
+        params = {
+            "query": q,
+            "size": size,
+            "page": page,
+            "sort": "accuracy",
+        }
+
+        with httpx.Client(timeout=8.0, trust_env=False) as client:
+            r = client.get(url, headers=headers, params=params)
+
+        if r.status_code != 200:
+            raise RuntimeError(f"Kakao keyword(accuracy) search failed: {r.status_code} {r.text}")
+
+        data = r.json()
+        docs = data.get("documents") or []
+        meta = data.get("meta") or {}
+        is_end = bool(meta.get("is_end", True))
+
+        for d in docs:
+            pid = str(d.get("id") or "").strip()
+            key = pid or f"{d.get('x','')},{d.get('y','')},{d.get('place_name','')}"
+            if not key or key in seen:
+                continue
+            seen.add(key)
             docs_all.append(d)
             if len(docs_all) >= max_results:
                 break
@@ -487,18 +545,33 @@ CategoryScope = Literal["cafe", "food", "food_cafe"]
 
 
 # -------------------------
-# Helpers for category-double search
+# Helpers for matching
 # -------------------------
 def _norm(s: str) -> str:
     return (s or "").strip().lower().replace(" ", "")
 
 
-def _name_match(doc: Dict[str, Any], q: str) -> bool:
-    qn = _norm(q)
-    if not qn:
+def _match_all_terms_in_text(text_value: str, terms: List[str]) -> bool:
+    """
+    terms의 각 단어(공백 제거 기준)가 모두 text_value(공백 제거)에 포함되어야 True
+    예) text="스타벅스 홍대입구역사거리점", terms=["스타벅스","홍대"] => True
+    """
+    t = _norm(text_value)
+    if not t:
         return False
-    name = _norm(str(doc.get("place_name") or doc.get("name") or ""))
-    return qn in name
+
+    for term in terms:
+        tn = _norm(term)
+        if not tn:
+            continue
+        if tn not in t:
+            return False
+    return True
+
+
+def _name_match_terms(doc: Dict[str, Any], terms: List[str]) -> bool:
+    name = str(doc.get("place_name") or doc.get("name") or "")
+    return _match_all_terms_in_text(name, terms)
 
 
 def _only_allowed_items(items: List[PlaceItem]) -> List[PlaceItem]:
@@ -523,23 +596,21 @@ def search_places(
     db: Session = Depends(get_db),
 ) -> PlacesSearchResponse:
     """
-    검색창에서 이용자가 가고자 하는 곳 검색
-    - (기본) 2글자 이상부터 검색
-    - cache 먼저 보고 부족하면 api 호출
+    기능:
+    1) 내 위치 기반: "스타" -> 내 위치 기준 가까운 순
+    2) 목적지+매장: "스타벅스 홍대" -> 홍대 좌표를 앵커로 잡고, '스타벅스' 검색
+       단, 결과는 반드시 "스타벅스"+"홍대" 둘 다 이름에 포함되는 매장만 반환
     """
-    q = (query or "").strip()
-    if not q:
+    q_full = (query or "").strip()
+    if not q_full:
         raise HTTPException(status_code=400, detail="query is required")
 
     size = int(max(1, min(size, 45)))
     radius_m = int(max(0, min(int(radius_m), 20000)))
     cache = PlaceCacheService(db)
 
-    # -------------------------
-    # Min length guard (1글자 제한)
-    # -------------------------
     MIN_SEARCH_LEN = 2
-    if len(q) < MIN_SEARCH_LEN:
+    if len(q_full) < MIN_SEARCH_LEN:
         if response is not None:
             response.headers["X-Search-Guard"] = "query_too_short"
         return PlacesSearchResponse(items=[])
@@ -558,8 +629,83 @@ def search_places(
         elif category_scope == "food":
             allowed = {"FD6"}
         else:
-            allowed = {"CE7", "FD6"}  
+            allowed = {"CE7", "FD6"}
 
+    # -------------------------
+    # "뒤에 지역" 자동 추출 → center 좌표 전환
+    # -------------------------
+    anchor_used = False
+    anchor_query = ""
+    anchor_by = ""
+    anchor_err = ""
+
+    lat0, lng0 = float(lat), float(lng)  # 기본: 내 위치
+    q = q_full  # 기본: 전체 쿼리
+
+    def _pick_anchor_doc(docs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        # 지역 앵커는 매장(CE7/FD6)보다는 지명/역 등을 우선
+        if not docs:
+            return None
+        for d in docs:
+            c = _doc_cgc(d)
+            if c and (c not in ALLOWED_CGC):
+                return d
+        return docs[0]
+
+    tokens = q_full.split()
+    if len(tokens) >= 2:
+        max_k = min(3, len(tokens) - 1)
+        for k in range(1, max_k + 1):
+            loc_candidate = " ".join(tokens[-k:]).strip()
+            place_candidate = " ".join(tokens[:-k]).strip()
+
+            if len(place_candidate) < MIN_SEARCH_LEN:
+                continue
+
+            cached = _anchor_cache.get(loc_candidate)
+            if cached:
+                alat, alng = cached
+                if alat and alng:
+                    anchor_used = True
+                    anchor_query = loc_candidate
+                    anchor_by = "cache"
+                    lat0, lng0 = float(alat), float(alng)
+                    q = place_candidate
+                    break
+
+            try:
+                adocs = kakao_keyword_search_accuracy(query=loc_candidate, max_results=8)
+                a = _pick_anchor_doc(adocs)
+                if a:
+                    alat = _safe_float(a.get("y"), 0.0)
+                    alng = _safe_float(a.get("x"), 0.0)
+                    if alat and alng:
+                        _anchor_cache[loc_candidate] = (float(alat), float(alng))
+                        anchor_used = True
+                        anchor_query = loc_candidate
+                        anchor_by = "keyword-accuracy"
+                        lat0, lng0 = float(alat), float(alng)
+                        q = place_candidate
+                        break
+            except Exception as e:
+                anchor_err = e.__class__.__name__
+                continue
+
+    if len(q) < MIN_SEARCH_LEN:
+        if response is not None:
+            response.headers["X-Search-Guard"] = "query_too_short_after_anchor"
+        return PlacesSearchResponse(items=[])
+
+    if anchor_used:
+        name_terms = [q, anchor_query]
+        q_db = (q.split()[0] if q.split() else q)  
+    else:
+        name_terms = [t for t in q_full.split() if t] or [q_full]
+        q_db = (name_terms[0] if name_terms else q_full)
+
+    # -------------------------
+    # DEBUG headers
+    # -------------------------
     if response is not None:
         try:
             db_name = db.execute(text("select current_database()")).scalar()
@@ -569,19 +715,28 @@ def search_places(
             response.headers["X-PlaceCache-TTL"] = str(cache.ttl_s)
             response.headers["X-App-File"] = __file__
             response.headers["X-Query"] = quote(q, safe="")
+            response.headers["X-Query-Full"] = quote(q_full, safe="")
             response.headers["X-Allowed-CGC"] = ",".join(sorted(list(allowed)))
+            response.headers["X-Name-Terms"] = quote("|".join(name_terms), safe="")
+
+            response.headers["X-Anchor-Used"] = "1" if anchor_used else "0"
+            response.headers["X-Anchor-Query"] = quote(anchor_query, safe="") if anchor_used else ""
+            response.headers["X-Anchor-By"] = anchor_by
+            response.headers["X-Anchor-Err"] = anchor_err
+            response.headers["X-Anchor-Lat"] = f"{lat0:.7f}"
+            response.headers["X-Anchor-Lng"] = f"{lng0:.7f}"
         except Exception:
             pass
 
     # -------------------------
-    # 1) cache search
+    # 1) cache search (lat0/lng0 기준)
     # -------------------------
     cached_items: List[PlaceItem] = []
     if scope in ("cache", "all"):
         rows = cache.search_nearby_in_db(
-            query=q,
-            lat=lat,
-            lng=lng,
+            query=q_db,         
+            lat=lat0,
+            lng=lng0,
             radius_m=radius_m,
             limit=size,
             allowed_category_group_codes=allowed,
@@ -590,6 +745,8 @@ def search_places(
         for r, d in rows:
             item = PlaceItem(**cache.row_to_place_dict(r, distance_m=d))
             if _norm_cgc(item.category_group_code) not in allowed:
+                continue
+            if not _match_all_terms_in_text(item.name, name_terms):
                 continue
             cached_items.append(item)
 
@@ -606,26 +763,28 @@ def search_places(
         return PlacesSearchResponse(items=_only_allowed_items(cached_items[:size]))
 
     # -------------------------
-    # 2) api fetch
+    # 2) api fetch (lat0/lng0 기준)
     # -------------------------
     need = size if scope == "api" else (size - cache_hits)
     need = int(max(1, min(need, 45)))
 
     docs: List[Dict[str, Any]] = []
 
+    # category-double: 주변 후보를 넓게 모으고 -> name_terms로 필터링
     try:
         tmp: List[Dict[str, Any]] = []
-        for code in sorted(list(allowed)): 
+        for code in sorted(list(allowed)):
             tmp.extend(
                 kakao_category_search(
                     category_group_code=code,
-                    lat=lat,
-                    lng=lng,
+                    lat=lat0,
+                    lng=lng0,
                     radius_m=radius_m,
                     max_results=45,
                 )
             )
-        tmp = [d for d in tmp if _name_match(d, q)]
+
+        tmp = [d for d in tmp if _name_match_terms(d, name_terms)] 
 
         seen = set()
         for d in tmp:
@@ -648,15 +807,16 @@ def search_places(
             response.headers["X-Api-Mode"] = f"category-double-failed:{e.__class__.__name__}"
         docs = []
 
+    # keyword fallback
     if not docs:
         try:
-            docs = kakao_keyword_search(query=q, lat=lat, lng=lng, radius_m=radius_m, max_results=need)
+            docs = kakao_keyword_search(query=q, lat=lat0, lng=lng0, radius_m=radius_m, max_results=need)
         except RuntimeError as e:
             raise HTTPException(status_code=500, detail=str(e))
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"places search failed: {e}")
 
-        docs = [d for d in docs if _doc_cgc(d) in allowed]
+        docs = [d for d in docs if _doc_cgc(d) in allowed and _name_match_terms(d, name_terms)]
 
         if response is not None:
             response.headers["X-Api-Mode"] = "keyword"
@@ -673,8 +833,10 @@ def search_places(
         pid = _safe_str(d.get("id")).strip()
         if not pid or pid in seen_ids:
             continue
-
         if _doc_cgc(d) not in allowed:
+            continue
+
+        if not _name_match_terms(d, name_terms):
             continue
 
         seen_ids.add(pid)
@@ -730,8 +892,8 @@ def insight(
     db: Session = Depends(get_db),
 ) -> PlacesInsightResponse:
     """
-    사용자가 검색창 입력 후 그 중 하나를 선택했을 때
-    장소의 nearest zone 혼잡도 + 주변 대안 장소(덜 붐비는 쪽 우선) 추천할 때
+    사용자가 검색창 입력 후 리스트에서 선택 시
+    장소의 nearest zone 혼잡도 + 주변 대안 장소(덜 붐비는 쪽 우선) 추천
     """
     if req.recommend_from not in {"selected", "user"}:
         raise HTTPException(status_code=400, detail="recommend_from must be 'selected' or 'user'")
@@ -758,9 +920,6 @@ def insight(
     min_interval_s = int(os.getenv("CROWDING_SNAPSHOT_MIN_INTERVAL_S", "600"))
     crowding = CrowdingService()
 
-    # -------------------------
-    # Place snapshot helpers (ORM + fallback raw SQL)
-    # -------------------------
     place_snap = PlaceCrowdingSnapshotService(db)
     place_snap_dirty = False
     place_snap_selected_added = 0
@@ -829,7 +988,6 @@ def insight(
         if not pid:
             return False
 
-        # 1) ORM 방식 (서비스 재사용)
         try:
             with db.begin_nested():
                 did_add = place_snap.record(
@@ -852,7 +1010,6 @@ def insight(
         except Exception as e:
             place_snap_err = e.__class__.__name__
 
-        # 2) fallback raw SQL
         try:
             latest = _raw_latest_ts(pid)
             min_s = int(os.getenv("PLACE_CROWDING_SNAPSHOT_MIN_INTERVAL_S", "1800"))
@@ -880,9 +1037,6 @@ def insight(
             place_snap_err = f"{place_snap_err}->{e2.__class__.__name__}" if place_snap_err else e2.__class__.__name__
             return False
 
-    # -------------------------
-    # zone snapshot
-    # -------------------------
     snapshot_cache: Dict[str, ZoneInfo] = {}
     wrote_any = False
     cache_dirty = False
@@ -903,9 +1057,6 @@ def insight(
     selected_place = _maybe_enrich_image(selected_item, req.include_image)
     selected = PlaceWithZone(place=selected_place, zone=selected_zone)
 
-    # -------------------------
-    # Record selected snapshot
-    # -------------------------
     try:
         did = _record_place_snapshot(
             place_id=selected_item.id,
@@ -927,16 +1078,13 @@ def insight(
     except Exception as e:
         place_snap_err = e.__class__.__name__
 
-    # -------------------------
-    # candidate fetching (cache -> api)
-    # -------------------------
     place_cache = PlaceCacheService(db)
     ttl_s = int(os.getenv("PLACE_CACHE_TTL_S", "86400"))
 
     cached = place_cache.get_cached_places_near(
         lat=center_lat,
         lng=center_lng,
-        radius_m=radius_m, 
+        radius_m=radius_m,
         category_group_code=cgc,
         limit=int(req.max_candidates),
         ttl_s=ttl_s,
@@ -967,7 +1115,7 @@ def insight(
                 category_group_code=cgc,
                 lat=center_lat,
                 lng=center_lng,
-                radius_m=radius_m,  
+                radius_m=radius_m,
                 max_results=int(req.max_candidates),
             )
         except Exception as e:
@@ -980,9 +1128,6 @@ def insight(
             except Exception:
                 pass
 
-    # -------------------------
-    # build candidates + record snapshots
-    # -------------------------
     candidates: List[PlaceWithZone] = []
     for d in docs:
         p = _doc_to_place(d)
@@ -1025,9 +1170,6 @@ def insight(
 
         candidates.append(PlaceWithZone(place=p, zone=zinfo))
 
-    # -------------------------
-    # commit
-    # -------------------------
     committed = False
     if wrote_any or cache_dirty or place_snap_dirty:
         try:
@@ -1037,9 +1179,6 @@ def insight(
             db.rollback()
             place_snap_err = place_snap_err or e.__class__.__name__
 
-    # -------------------------
-    # debug headers
-    # -------------------------
     if response is not None:
         try:
             response.headers["X-PlaceSnap-Selected-Added"] = str(place_snap_selected_added)
@@ -1062,6 +1201,7 @@ def insight(
 
     return PlacesInsightResponse(selected=selected, alternatives=alternatives)
 
+
 @router.get("/profile")
 def place_profile(
     place_id: str = Query(..., description="Kakao place id"),
@@ -1069,9 +1209,6 @@ def place_profile(
     min_samples: int = Query(3, ge=1, le=100, description="셀당 최소 샘플 수"),
     db: Session = Depends(get_db),
 ):
-    """
-    이 장소는 요일×시간대별로 언제 덜 붐비는지 보여줄 때 (표/히트맵)
-    """
     svc = PlaceProfileService(db)
     return svc.weekly_hourly_profile(place_id=place_id, days=days, min_samples=min_samples)
 
@@ -1086,9 +1223,6 @@ def recommend_times(
     include_low_samples: bool = Query(False),
     db: Session = Depends(get_db),
 ):
-    """
-    사용자에게 “요일별 덜 붐비는 시간대 추천” 문장/카드로 보여줄 때
-    """
     try:
         svc = PlaceProfileService(db)
         return svc.recommend_quiet_times(
